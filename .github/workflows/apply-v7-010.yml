@@ -1,0 +1,303 @@
+name: GRIDMaster v7.010 Recovery Loss-Budget Fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-v7-010.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch GRIDMaster to v7.010
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          p = Path('GRIDMaster.mq5')
+          s = p.read_text(encoding='utf-8')
+
+          # Version / labels. This is intentionally idempotent so it can repair
+          # either the v7.008 base or an already-installed v7.009 file.
+          s = re.sub(r'// v7\.00[89] - .*', '// v7.010 - RECOVERY V5 + LOSS BUDGET + PROFIT EFFICIENCY', s, count=1)
+          s = re.sub(r'#property version\s+"7\.00[89]"', '#property version   "7.010"', s, count=1)
+          s = s.replace('GRID MASTER v7.008', 'GRID MASTER v7.010')
+          s = s.replace('GRID MASTER v7.009', 'GRID MASTER v7.010')
+          s = s.replace('GRIDMaster v7.008', 'GRIDMaster v7.010')
+          s = s.replace('GRIDMaster v7.009', 'GRIDMaster v7.010')
+
+          # Recovery controls.
+          s = re.sub(r'input double RecoveryConcentrationRatio=[0-9.]+;', 'input double RecoveryConcentrationRatio=0.50;', s, count=1)
+          s = re.sub(r'input double GrossLossRecoveryTriggerUSD=[0-9.]+;', 'input double GrossLossRecoveryTriggerUSD=25.0;', s, count=1)
+          if 'input double RecoveryNetLossTriggerUSD=' not in s:
+              anchor = 'input double GrossLossRecoveryTriggerUSD=25.0;\n'
+              s = s.replace(anchor, anchor + 'input double RecoveryNetLossTriggerUSD=10.0;\n', 1)
+          if 'input double RecoveryPartialClosePercent=' not in s:
+              anchor = 'input double RecoveryNetLossTriggerUSD=10.0;\n'
+              s = s.replace(anchor, anchor + 'input double RecoveryPartialClosePercent=50.0;\n', 1)
+          if 'input double RecoveryMaxRealizedLossUSD=' not in s:
+              anchor = 'input double RecoveryPartialClosePercent=50.0;\n'
+              s = s.replace(anchor, anchor + 'input double RecoveryMaxRealizedLossUSD=5.0;\n', 1)
+
+          # Replace RiskRecoveryV4 with a more balanced engine.
+          start = s.find('//================================================================================================//\n// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION')
+          if start < 0:
+              start = s.find('//================================================================================================//\n// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION')
+          end_marker = '//================================================================================================//\n// LEGACY RECOVERY GOVERNOR - DD / BASKET TRIGGER'
+          end = s.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('Recovery V4 section not found')
+
+          recovery = r'''//================================================================================================//
+// RECOVERY V5 - LOSS BUDGET / STALE / SWAP PROTECTION
+// v7.010: recover earlier, but cap the amount of loss realized by each reduction.
+// Gross recovery requires DD + net basket loss + concentration. Stale/swap recovery
+// remains independent but never fires while the basket is profitable.
+//================================================================================================//
+void RiskRecoveryV4(double dd)
+{
+   if(BuyOrders+SellOrders==0) return;
+   if(TimeCurrent()<FreezeGridUntil) return;
+   if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec) return;
+   if(ReductionActions>=MaxReductionActions) return;
+
+   double grossLoss=0.0;
+   double worstLoss=0.0;
+   double worstSwap=0.0;
+   datetime oldestLosing=0;
+   ulong worstTicket=0;
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0||!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade) continue;
+
+      double net=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+      datetime opened=(datetime)PositionGetInteger(POSITION_TIME);
+      if(net<0.0)
+      {
+         double loss=-net;
+         grossLoss+=loss;
+         if(loss>worstLoss)
+         {
+            worstLoss=loss;
+            worstSwap=PositionGetDouble(POSITION_SWAP);
+            worstTicket=ticket;
+         }
+         if(oldestLosing==0||opened<oldestLosing) oldestLosing=opened;
+      }
+   }
+
+   if(worstTicket==0) return;
+
+   double netBasket=BuyProfits+SellProfits;
+   double ageHours=(oldestLosing>0)?(double)(TimeCurrent()-oldestLosing)/3600.0:0.0;
+   double concentration=(grossLoss>0.0)?worstLoss/grossLoss:0.0;
+
+   bool ddGate=(dd>=RecoveryStartDD);
+   bool basketLossGate=(RecoveryNetLossTriggerUSD<=0.0 || netBasket<=-RecoveryNetLossTriggerUSD);
+   bool grossTrigger=(ddGate && basketLossGate && GrossLossRecoveryTriggerUSD>0.0 && grossLoss>=GrossLossRecoveryTriggerUSD && concentration>=RecoveryConcentrationRatio);
+   bool staleTrigger=(StalePositionHours>0.0 && ageHours>=StalePositionHours && netBasket<0.0);
+   bool swapTrigger=(MaxPositionSwapLossUSD>0.0 && worstSwap<=-MaxPositionSwapLossUSD && netBasket<0.0);
+
+   if(!(grossTrigger||staleTrigger||swapTrigger)) return;
+
+   string reason="RECOVERY-V5";
+   if(staleTrigger) reason="RECOVERY-STALE";
+   else if(swapTrigger) reason="RECOVERY-SWAP";
+   else reason="RECOVERY-GROSS";
+
+   if(ReduceLargestLoser(reason))
+   {
+      PrintFormat("[RECOVERY V5] %s | gross=%.2f | worst=%.2f | concentration=%.2f | age=%.1fh | swap=%.2f | basket=%.2f | DD=%.2f%%",
+                  reason,grossLoss,worstLoss,concentration,ageHours,worstSwap,netBasket,dd);
+   }
+}
+
+'''
+          s = s[:start] + recovery + s[end:]
+
+          # Ensure the legacy governor cannot realize a loss against a profitable basket.
+          rg_start = s.find('void RecoveryGovernor(double dd)')
+          rg_end = s.find('double BasketLoss(ENUM_POSITION_TYPE type)', rg_start)
+          if rg_start < 0 or rg_end < 0:
+              raise SystemExit('RecoveryGovernor boundaries not found')
+
+          governor = r'''void RecoveryGovernor(double dd)
+{
+   if(BuyOrders+SellOrders==0) return;
+   if(TimeCurrent()<FreezeGridUntil) return;
+   if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec) return;
+   if(ReductionActions>=MaxReductionActions) return;
+
+   double bl=BasketLoss(POSITION_TYPE_BUY);
+   double sl=BasketLoss(POSITION_TYPE_SELL);
+   double netBasket=BuyProfits+SellProfits;
+   bool basketLossGate=(RecoveryNetLossTriggerUSD<=0.0 || netBasket<=-RecoveryNetLossTriggerUSD);
+   bool active=dd>=RecoveryStartDD;
+   bool aggressive=dd>=AggressiveRecoveryDD;
+   bool survival=dd>=SurvivalDD;
+
+   if(survival)
+   {
+      CurrentState=STATE_SURVIVAL;
+      if(bl>=SurvivalBasketLossUSD&&bl>=sl&&BuyOrders>0)
+      {
+         if(CloseSide(POSITION_TYPE_BUY,"SURVIVAL-BUY"))
+         {
+            RecoveryActionThisTick=true;
+            SetFreeze();
+            return;
+         }
+      }
+      if(sl>=SurvivalBasketLossUSD&&sl>bl&&SellOrders>0)
+      {
+         if(CloseSide(POSITION_TYPE_SELL,"SURVIVAL-SELL"))
+         {
+            RecoveryActionThisTick=true;
+            SetFreeze();
+            return;
+         }
+      }
+   }
+
+   if(active && basketLossGate && (aggressive || bl>=RecoveryLossTriggerUSD || sl>=RecoveryLossTriggerUSD))
+   {
+      if(ReduceLargestLoser("RECOVERY-DD")) return;
+   }
+
+   if(basketLossGate && bl+sl>=RecoveryDistributedLossTriggerUSD && bl+sl>=MinRecoveryLossUSD)
+   {
+      if(ReduceLargestLoser("RECOVERY-DISTRIBUTED")) return;
+   }
+}
+'''
+          s = s[:rg_start] + governor + s[rg_end:]
+
+          # Replace reduction logic with a realized-loss budget.
+          rl_start = s.find('ulong LargestLosingTicket()')
+          rl_end = s.find('void SetFreeze()', rl_start)
+          if rl_start < 0 or rl_end < 0:
+              raise SystemExit('Reduction boundaries not found')
+
+          reduction = r'''ulong LargestLosingTicket()
+{
+   ulong best=0;
+   double bestVol=0.0;
+   double bestLoss=0.0;
+   datetime oldest=0;
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+      if(t==0||!PositionSelectByTicket(t)) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade) continue;
+
+      double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+      if(p>=0.0) continue;
+
+      double loss=-p;
+      double vol=PositionGetDouble(POSITION_VOLUME);
+      datetime ot=(datetime)PositionGetInteger(POSITION_TIME);
+
+      if(vol>bestVol+1e-8 ||
+         (MathAbs(vol-bestVol)<=1e-8 && loss>bestLoss+1e-8) ||
+         (MathAbs(vol-bestVol)<=1e-8 && MathAbs(loss-bestLoss)<=1e-8 && (oldest==0||ot<oldest)))
+      {
+         best=t;
+         bestVol=vol;
+         bestLoss=loss;
+         oldest=ot;
+      }
+   }
+   return best;
+}
+
+bool ReduceLargestLoser(string reason)
+{
+   ulong t=LargestLosingTicket();
+   if(t==0||!PositionSelectByTicket(t)) return false;
+
+   ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double loss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));
+   double vol=PositionGetDouble(POSITION_VOLUME);
+   double minVol=SymbolInfoDouble(SymbolTrade,SYMBOL_VOLUME_MIN);
+   double step=SymbolInfoDouble(SymbolTrade,SYMBOL_VOLUME_STEP);
+   double closeVol=vol;
+
+   if(RecoveryPartialClosePercent>0.0 && RecoveryPartialClosePercent<100.0 && step>0.0 && vol>minVol+1e-10)
+   {
+      double desired=vol*(RecoveryPartialClosePercent/100.0);
+
+      // Cap the reduction by the maximum realized loss budget.
+      if(RecoveryMaxRealizedLossUSD>0.0 && loss>0.0)
+      {
+         double lossPerLot=loss/vol;
+         if(lossPerLot>0.0)
+            desired=MathMin(desired,RecoveryMaxRealizedLossUSD/lossPerLot);
+      }
+
+      double normalized=NormalizeVolume(desired);
+      double remaining=vol-normalized;
+      if(normalized>=minVol-1e-10 && remaining>=minVol-1e-10)
+         closeVol=normalized;
+   }
+
+   bool closed=false;
+   if(closeVol<vol-1e-10)
+      closed=ClosePositionVolume(t,closeVol,reason);
+   else
+      closed=ClosePosition(t,reason);
+
+   if(!closed) return false;
+
+   ReductionActions++;
+   LastRecoveryAction=TimeCurrent();
+   FreezeGridUntil=TimeCurrent()+RecoveryFreezeSec;
+   LockDirection(type,reason);
+   RecoveryActionThisTick=true;
+
+   PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | originalLot=%.4f | closedLot=%.4f | estimatedLoss=%.2f | action=%d/%d",
+               reason,t,EnumToString(type),vol,closeVol,loss*(closeVol/vol),ReductionActions,MaxReductionActions);
+   return true;
+}
+
+'''
+          s = s[:rl_start] + reduction + s[rl_end:]
+
+          # Safety checks: exactly one implementation of each critical function.
+          if s.count('void RiskRecoveryV4(double dd)') != 1:
+              raise SystemExit('RiskRecoveryV4 count check failed')
+          if s.count('void RecoveryGovernor(double dd)') != 1:
+              raise SystemExit('RecoveryGovernor count check failed')
+          if s.count('bool ReduceLargestLoser(string reason)') != 1:
+              raise SystemExit('ReduceLargestLoser count check failed')
+          if s.count('bool ClosePositionVolume(ulong ticket,double volume,string reason)') != 1:
+              raise SystemExit('ClosePositionVolume count check failed')
+          if 'RecoveryMaxRealizedLossUSD' not in s:
+              raise SystemExit('Recovery loss budget input missing')
+
+          p.write_text(s, encoding='utf-8')
+
+      - name: Validate and commit
+        shell: bash
+        run: |
+          grep -q '#property version   "7.010"' GRIDMaster.mq5
+          grep -q 'RecoveryNetLossTriggerUSD' GRIDMaster.mq5
+          grep -q 'RecoveryPartialClosePercent' GRIDMaster.mq5
+          grep -q 'RecoveryMaxRealizedLossUSD' GRIDMaster.mq5
+          grep -q 'void RiskRecoveryV4(double dd)' GRIDMaster.mq5
+          grep -q 'bool ClosePositionVolume(ulong ticket,double volume,string reason)' GRIDMaster.mq5
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GRIDMaster.mq5
+          git rm .github/workflows/apply-v7-010.yml
+          git commit -m 'Release GRIDMaster v7.010 recovery loss-budget fix'
+          git push
