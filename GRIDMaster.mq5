@@ -1,6 +1,6 @@
 //================================================================================================//
 // GRIDMaster - PROFIT PROTECTION / BASKET RECOVERY EDITION 2026
-// v7.006 - RECOVERY V2 + SAFE BASKET CLOSE ENGINE + CATASTROPHIC PROTECTION
+// v7.007 - RECOVERY V3 + LOSS-TRIGGERED RECOVERY + SAFE BASKET CLOSE
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
@@ -62,6 +62,8 @@ input double SurvivalDD=10.0;
 input int RecoveryCooldownSec=30;
 input int RecoveryFreezeSec=60;
 input double MinRecoveryLossUSD=20.0;
+input double RecoveryLossTriggerUSD=20.0;
+input double RecoveryDistributedLossTriggerUSD=30.0;
 input double RecoveryConcentrationRatio=0.45;
 input double SurvivalBasketLossUSD=45.0;
 input int MaxReductionActions=3;
@@ -113,7 +115,7 @@ bool IsTradingHour(){if(!UseTradingHour)return true;MqlDateTime dt;TimeToStruct(
 //================================================================================================//
 // INITIALIZATION
 //================================================================================================//
-int OnInit(){SymbolTrade=_Symbol;OrdersID=(MagicNumber==0)?101010:MagicNumber;HandleRSI=iRSI(SymbolTrade,PERIOD_CURRENT,RSIPeriod,PRICE_CLOSE);HandleMA=iMA(SymbolTrade,PERIOD_CURRENT,MAPeriod,0,MODE_SMA,PRICE_CLOSE);InitialBalance=AccountInfoDouble(ACCOUNT_BALANCE);PeakEquity=MathMax(InitialBalance,AccountInfoDouble(ACCOUNT_EQUITY));HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;MaxBasketProfitSeen=0.0;BuyDirectionLocked=false;SellDirectionLocked=false;HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}PrintFormat("[INIT] GRIDMaster v7.006 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());return INIT_SUCCEEDED;}
+int OnInit(){SymbolTrade=_Symbol;OrdersID=(MagicNumber==0)?101010:MagicNumber;HandleRSI=iRSI(SymbolTrade,PERIOD_CURRENT,RSIPeriod,PRICE_CLOSE);HandleMA=iMA(SymbolTrade,PERIOD_CURRENT,MAPeriod,0,MODE_SMA,PRICE_CLOSE);InitialBalance=AccountInfoDouble(ACCOUNT_BALANCE);PeakEquity=MathMax(InitialBalance,AccountInfoDouble(ACCOUNT_EQUITY));HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;MaxBasketProfitSeen=0.0;BuyDirectionLocked=false;SellDirectionLocked=false;HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}PrintFormat("[INIT] GRIDMaster v7.007 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());return INIT_SUCCEEDED;}
 void OnDeinit(const int reason){if(HandleRSI!=INVALID_HANDLE)IndicatorRelease(HandleRSI);if(HandleMA!=INVALID_HANDLE)IndicatorRelease(HandleMA);Comment("");}
 
 //================================================================================================//
@@ -219,18 +221,25 @@ void RecoveryGovernor(double dd){
       return;
    }
 
-   if(dd<RecoveryStartDD)return;
+   // V3: recovery can be triggered by floating basket loss even when equity DD
+   // has not reached RecoveryStartDD. This prevents a $20-$60 basket loss from
+   // bypassing recovery simply because a profitable hedge keeps account DD low.
+   bool lossTrigger=(RecoveryLossTriggerUSD>0.0&&basketLoss>=RecoveryLossTriggerUSD);
+   bool ddTrigger=(dd>=RecoveryStartDD);
+   if(!lossTrigger&&!ddTrigger)return;
+
+   // Do not cut tiny distributed losses. If DD is still below aggressive mode,
+   // require either a concentrated loser or a larger distributed basket loss.
    if(basketLoss<MinRecoveryLossUSD)return;
 
    ulong loser=LargestLosingTicket();
    if(loser==0||!PositionSelectByTicket(loser))return;
    double largestLoss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));
    double concentration=(basketLoss>0.0)?largestLoss/basketLoss:0.0;
-   // At normal recovery DD, only cut a position that materially dominates risk.
-   // At aggressive DD, allow reduction even when losses are distributed.
-   if(dd<AggressiveRecoveryDD&&concentration<RecoveryConcentrationRatio)return;
+   if(dd<AggressiveRecoveryDD && concentration<RecoveryConcentrationRatio &&
+      basketLoss<RecoveryDistributedLossTriggerUSD)return;
 
-   if(ReduceLargestLoser("RECOVERY"))return;
+   if(ReduceLargestLoser(lossTrigger?"RECOVERY-LOSS-TRIGGER":"RECOVERY-DD"))return;
 }
 
 //================================================================================================//
@@ -273,14 +282,24 @@ bool CloseBestAvailable(string reason,bool wantProfit){
 }
 
 void CloseAllManaged(string reason){
-   // Re-snapshot before every close. This avoids stale ticket/volume state and
-   // makes the basket close resilient to partial fills and fast XAUUSD ticks.
+   // Re-snapshot before every close. For protection/recovery exits, close the
+   // largest losing exposure first so a profitable hedge is not removed before
+   // the risk that triggered protection. For normal basket-profit exits, bank
+   // profitable exposure first.
+   bool protection=(StringFind(reason,"MAX-BASKET")>=0 || StringFind(reason,"CATASTROPHIC")>=0 ||
+                    StringFind(reason,"EMERGENCY")>=0 || StringFind(reason,"HARD-DD")>=0 ||
+                    StringFind(reason,"SURVIVAL")>=0 || StringFind(reason,"RECOVERY")>=0);
    for(int pass=0;pass<20;pass++){
       UpdateStatus();
       if(BuyOrders+SellOrders==0)return;
       bool changed=false;
-      if(CloseBestAvailable(reason,true))changed=true;
-      else if(CloseBestAvailable(reason,false))changed=true;
+      if(protection){
+         if(CloseBestAvailable(reason,false))changed=true;
+         else if(CloseBestAvailable(reason,true))changed=true;
+      }else{
+         if(CloseBestAvailable(reason,true))changed=true;
+         else if(CloseBestAvailable(reason,false))changed=true;
+      }
       if(!changed)break;
    }
    UpdateStatus();
@@ -294,5 +313,5 @@ bool ClosePosition(ulong ticket,string reason){if(ticket==0||!PositionSelectByTi
 // DASHBOARD
 //================================================================================================//
 string StateText(){if(CurrentState==STATE_MONITOR)return "MONITOR";if(CurrentState==STATE_REDUCE)return "REDUCE";if(CurrentState==STATE_SURVIVAL)return "SURVIVAL";if(CurrentState==STATE_EMERGENCY)return "EMERGENCY";if(CurrentState==STATE_LOCKED)return "LOCKED";return "NORMAL";}
-void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.006 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","BUY LOCK: ",(BuyDirectionLocked?"YES":"NO")," | SELL LOCK: ",(SellDirectionLocked?"YES":"NO"),"\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
+void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.007 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","BUY LOCK: ",(BuyDirectionLocked?"YES":"NO")," | SELL LOCK: ",(SellDirectionLocked?"YES":"NO"),"\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
 //================================================================================================//
