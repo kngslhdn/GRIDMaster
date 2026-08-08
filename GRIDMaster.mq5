@@ -155,7 +155,6 @@ void OnTick()
       CloseAllOrders();
       UpdateStatus();
 
-      // Do not terminate until all managed positions are actually gone.
       if(BuyOrders == 0 && SellOrders == 0)
       {
          IsTerminated = true;
@@ -239,11 +238,10 @@ void ManageExit(bool recovery)
    double target = recovery ? (TargetProfitUSD + 2.0) : TargetProfitUSD;
 
    //========================================================
-   // TRAILING STATE RULE
-   // Once a basket reaches TrailingStartUSD, its peak profit
-   // remains armed until that basket is actually closed.
-   // The current profit may fall BELOW TrailingStartUSD and
-   // must still trigger the trailing stop.
+   // TRAILING STATE
+   // Once armed, peak profit remains active until the basket
+   // is actually closed. A retrace below TrailingStartUSD is
+   // still allowed to trigger the trailing stop.
    //========================================================
 
    if(BuyOrders == 0)
@@ -262,12 +260,11 @@ void ManageExit(bool recovery)
       }
       else
       {
-         // Arm trailing once profit reaches the start threshold.
          if(BuyProfits >= TrailingStartUSD && BuyProfits > MaxBuyProfitSeen)
             MaxBuyProfitSeen = BuyProfits;
 
-         // IMPORTANT: do NOT require BuyProfits >= TrailingStartUSD here.
-         // A retrace below the start level must still close the basket.
+         // Do not gate this check by current BuyProfits >= TrailingStartUSD.
+         // Example: peak=10, trailing stop=2 -> close at <=8, even if current profit is below 5.
          if(MaxBuyProfitSeen >= TrailingStartUSD &&
             BuyProfits <= MaxBuyProfitSeen - TrailingStopUSD)
          {
@@ -286,11 +283,9 @@ void ManageExit(bool recovery)
       }
       else
       {
-         // Arm trailing once profit reaches the start threshold.
          if(SellProfits >= TrailingStartUSD && SellProfits > MaxSellProfitSeen)
             MaxSellProfitSeen = SellProfits;
 
-         // IMPORTANT: do NOT require SellProfits >= TrailingStartUSD here.
          if(MaxSellProfitSeen >= TrailingStartUSD &&
             SellProfits <= MaxSellProfitSeen - TrailingStopUSD)
          {
@@ -340,7 +335,7 @@ void UpdateStatus()
       }
    }
 
-   // Reset trailing state ONLY when that basket is actually gone.
+   // Reset state ONLY after the basket has actually disappeared.
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
