@@ -1,0 +1,130 @@
+name: GRIDMaster v7.008 Recovery V4
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-v7-008.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch GRIDMaster to v7.008
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('GRIDMaster.mq5')
+          s = p.read_text(encoding='utf-8')
+
+          # Version/header
+          s = s.replace('// v7.007 - RECOVERY V3 + LOSS-TRIGGERED RECOVERY + SAFE BASKET CLOSE',
+                        '// v7.008 - RECOVERY V4 + GROSS LOSS + STALE POSITION + SWAP PROTECTION')
+          s = s.replace('#property version   "7.006"', '#property version   "7.008"')
+
+          # New Recovery V4 controls.
+          anchor = 'input double RecoveryConcentrationRatio=0.45;\n'
+          insert = '''input double RecoveryConcentrationRatio=0.45;\ninput double GrossLossRecoveryTriggerUSD=20.0;\ninput double StalePositionHours=72.0;\ninput double MaxPositionSwapLossUSD=20.0;\n'''
+          if 'GrossLossRecoveryTriggerUSD' not in s:
+              if anchor not in s:
+                  raise SystemExit('Recovery parameter anchor not found')
+              s = s.replace(anchor, insert, 1)
+
+          # Main engine: run Recovery V4 first; only run the legacy governor if V4 did not act.
+          old = 'if(UseRecoveryExit)RecoveryGovernor(dd);UpdateStatus();UpdateDirectionLocks();'
+          new = 'if(UseRecoveryExit){RiskRecoveryV4(dd);if(!RecoveryActionThisTick)RecoveryGovernor(dd);}UpdateStatus();UpdateDirectionLocks();'
+          if old not in s:
+              raise SystemExit('OnTick recovery call not found')
+          s = s.replace(old, new, 1)
+
+          # Insert Recovery V4 before the existing Recovery Governor section.
+          marker = '//================================================================================================//\n// RECOVERY GOVERNOR\n//================================================================================================//\n'
+          if 'void RiskRecoveryV4(double dd)' not in s:
+              if marker not in s:
+                  raise SystemExit('Recovery Governor marker not found')
+              block = r'''//================================================================================================//
+// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION
+// The old recovery trigger looked primarily at NET basket loss and DD. A profitable hedge can
+// mask a very large losing position, and a stale loser can accumulate swap for days. V4 treats
+// those as independent risk conditions. It reduces one losing position, locks its direction,
+// and freezes new grid risk before the basket reaches the $60 hard basket exit.
+//================================================================================================//
+void RiskRecoveryV4(double dd)
+{
+   if(BuyOrders+SellOrders==0) return;
+   if(TimeCurrent()<FreezeGridUntil) return;
+   if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec) return;
+   if(ReductionActions>=MaxReductionActions) return;
+
+   double grossLoss=0.0;
+   double worstLoss=0.0;
+   double worstSwap=0.0;
+   datetime oldestLosing=0;
+   ulong worstTicket=0;
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0||!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade) continue;
+
+      double profit=PositionGetDouble(POSITION_PROFIT);
+      double swap=PositionGetDouble(POSITION_SWAP);
+      double net=profit+swap;
+      datetime opened=(datetime)PositionGetInteger(POSITION_TIME);
+
+      if(net<0.0)
+      {
+         double loss=-net;
+         grossLoss+=loss;
+         if(loss>worstLoss)
+         {
+            worstLoss=loss;
+            worstSwap=swap;
+            worstTicket=ticket;
+         }
+         if(oldestLosing==0||opened<oldestLosing) oldestLosing=opened;
+      }
+   }
+
+   if(worstTicket==0) return;
+
+   double ageHours=(oldestLosing>0)?(double)(TimeCurrent()-oldestLosing)/3600.0:0.0;
+   bool grossTrigger=(GrossLossRecoveryTriggerUSD>0.0&&grossLoss>=GrossLossRecoveryTriggerUSD);
+   bool staleTrigger=(StalePositionHours>0.0&&ageHours>=StalePositionHours);
+   bool swapTrigger=(MaxPositionSwapLossUSD>0.0&&worstSwap<=-MaxPositionSwapLossUSD);
+
+   if(!(grossTrigger||staleTrigger||swapTrigger)) return;
+
+   string reason="RECOVERY-V4";
+   if(staleTrigger) reason="RECOVERY-STALE";
+   else if(swapTrigger) reason="RECOVERY-SWAP";
+   else if(grossTrigger) reason="RECOVERY-GROSS";
+
+   if(ReduceLargestLoser(reason))
+   {
+      PrintFormat("[RECOVERY V4] %s | grossLoss=%.2f | worstLoss=%.2f | age=%.1fh | worstSwap=%.2f | DD=%.2f%%",
+                  reason,grossLoss,worstLoss,ageHours,worstSwap,dd);
+   }
+}
+
+'''
+              s = s.replace(marker, block + marker, 1)
+
+          # Ensure dashboard/version diagnostics identify the new engine.
+          s = s.replace('GRIDMaster v7.007', 'GRIDMaster v7.008')
+
+          p.write_text(s, encoding='utf-8')
+
+      - name: Commit v7.008 and remove patch workflow
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GRIDMaster.mq5
+          git rm .github/workflows/apply-v7-008.yml
+          git commit -m 'Release GRIDMaster v7.008 Recovery V4'
+          git push
