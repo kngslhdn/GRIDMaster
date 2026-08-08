@@ -1,0 +1,1 @@
+GRIDMaster audit: 24/7 EXIT & PROTECTION fix prepared. Entry/grid logic preserved. Protection, trailing exit, and recovery exit are no longer gated by trading hours. Exit execution now validates trade-server retcodes and managed positions are filtered by MagicNumber + Symbol.
