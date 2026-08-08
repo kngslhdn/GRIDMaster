@@ -4,10 +4,11 @@
 // 24/7 EXIT & PROTECTION FIX
 // TRAILING STATE FIX
 // LAST GRID PRICE FIX
+// TRADE RESULT VALIDATION FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.004"
+#property version   "6.005"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -65,7 +66,6 @@ double   HighestPriceAfterSell = 0;
 double InitialBalance = 0;
 double AdaptiveEquityBase = 0;
 double LockedProfit = 0;
-
 double MaxBuyProfitSeen = 0;
 double MaxSellProfitSeen = 0;
 
@@ -145,9 +145,7 @@ void OnTick()
    double currentDrawdown = 0;
 
    if(AdaptiveEquityBase > 0 && equity < AdaptiveEquityBase)
-   {
       currentDrawdown = ((AdaptiveEquityBase - equity) / AdaptiveEquityBase) * 100.0;
-   }
 
    if(currentDrawdown >= MaxEquityLossPercent)
    {
@@ -238,13 +236,6 @@ void ManageExit(bool recovery)
 {
    double target = recovery ? (TargetProfitUSD + 2.0) : TargetProfitUSD;
 
-   //========================================================
-   // TRAILING STATE
-   // Once armed, peak profit remains active until the basket
-   // is actually closed. A retrace below TrailingStartUSD is
-   // still allowed to trigger the trailing stop.
-   //========================================================
-
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
@@ -324,7 +315,6 @@ void UpdateStatus()
          BuyOrders++;
          BuyProfits += p;
 
-         // CRITICAL: use the most recently opened BUY layer.
          if(openTime >= latestBuyTime)
          {
             latestBuyTime = openTime;
@@ -336,7 +326,6 @@ void UpdateStatus()
          SellOrders++;
          SellProfits += p;
 
-         // CRITICAL: use the most recently opened SELL layer.
          if(openTime >= latestSellTime)
          {
             latestSellTime = openTime;
@@ -345,7 +334,6 @@ void UpdateStatus()
       }
    }
 
-   // Reset trailing state ONLY after the basket has actually disappeared.
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
@@ -370,6 +358,13 @@ double GetMAValue()
 }
 
 //================================================================================================//
+bool IsMarketTradeSuccess(uint retcode)
+{
+   // For TRADE_ACTION_DEAL, PLACED is NOT a successful execution result.
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL);
+}
+
+//================================================================================================//
 void ExecuteTrade(ENUM_ORDER_TYPE type)
 {
    MqlTradeRequest req = {};
@@ -391,20 +386,20 @@ void ExecuteTrade(ENUM_ORDER_TYPE type)
 
    if(!OrderSend(req, res))
    {
-      PrintFormat("Gagal membuka %s. Error=%d RetCode=%u Comment=%s", EnumToString(type), GetLastError(), res.retcode, res.comment);
+      PrintFormat("[OPEN] OrderSend failed %s | Error=%d | RetCode=%u | Comment=%s",
+                  EnumToString(type), GetLastError(), res.retcode, res.comment);
       return;
    }
 
-   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL && res.retcode != TRADE_RETCODE_PLACED)
+   if(!IsMarketTradeSuccess(res.retcode))
    {
-      PrintFormat("Open %s rejected. RetCode=%u Comment=%s", EnumToString(type), res.retcode, res.comment);
+      PrintFormat("[OPEN] Trade rejected %s | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
+                  EnumToString(type), res.retcode, res.comment, res.order, res.deal);
+      return;
    }
-}
 
-//================================================================================================//
-bool IsCloseRetcodeSuccess(uint retcode)
-{
-   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
+   PrintFormat("[OPEN] Trade executed %s | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
+               EnumToString(type), res.retcode, res.order, res.deal, res.volume);
 }
 
 //================================================================================================//
@@ -442,14 +437,22 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
       ResetLastError();
       bool sent = OrderSend(req, res);
 
-      if(!sent || !IsCloseRetcodeSuccess(res.retcode))
+      if(!sent)
       {
-         PrintFormat("Gagal menutup tiket #%I64u. Sent=%s RetCode=%u Comment=%s Error=%d", t, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
+         PrintFormat("[CLOSE] OrderSend failed #%I64u | Error=%d | RetCode=%u | Comment=%s",
+                     t, GetLastError(), res.retcode, res.comment);
+         continue;
       }
-      else
+
+      if(!IsMarketTradeSuccess(res.retcode))
       {
-         PrintFormat("[EXIT] Close request accepted #%I64u RetCode=%u", t, res.retcode);
+         PrintFormat("[CLOSE] Trade rejected #%I64u | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
+                     t, res.retcode, res.comment, res.order, res.deal);
+         continue;
       }
+
+      PrintFormat("[CLOSE] Trade executed #%I64u | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
+                  t, res.retcode, res.order, res.deal, res.volume);
    }
 }
 
@@ -526,16 +529,26 @@ bool CloseRecoveryPosition(ulong ticket)
    ResetLastError();
    bool sent = OrderSend(req, res);
 
-   if(sent && IsCloseRetcodeSuccess(res.retcode))
+   if(!sent)
    {
-      LastRecoveryAction = TimeCurrent();
-      FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
-      PrintFormat("[REE] Recovery Close Success #%I64u RetCode=%u", ticket, res.retcode);
-      return true;
+      PrintFormat("[REE] Recovery close OrderSend failed #%I64u | Error=%d | RetCode=%u | Comment=%s",
+                  ticket, GetLastError(), res.retcode, res.comment);
+      return false;
    }
 
-   PrintFormat("[REE] Recovery Close Failed #%I64u | Sent=%s | RetCode=%u | Comment=%s | Error=%d", ticket, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
-   return false;
+   if(!IsMarketTradeSuccess(res.retcode))
+   {
+      PrintFormat("[REE] Recovery close rejected #%I64u | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
+                  ticket, res.retcode, res.comment, res.order, res.deal);
+      return false;
+   }
+
+   LastRecoveryAction = TimeCurrent();
+   FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
+
+   PrintFormat("[REE] Recovery Close Success #%I64u | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
+               ticket, res.retcode, res.order, res.deal, res.volume);
+   return true;
 }
 
 //================================================================================================//
