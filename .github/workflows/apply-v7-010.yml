@@ -23,8 +23,7 @@ jobs:
           p = Path('GRIDMaster.mq5')
           s = p.read_text(encoding='utf-8')
 
-          # Version / labels. This is intentionally idempotent so it can repair
-          # either the v7.008 base or an already-installed v7.009 file.
+          # Version / labels.
           s = re.sub(r'// v7\.00[89] - .*', '// v7.010 - RECOVERY V5 + LOSS BUDGET + PROFIT EFFICIENCY', s, count=1)
           s = re.sub(r'#property version\s+"7\.00[89]"', '#property version   "7.010"', s, count=1)
           s = s.replace('GRID MASTER v7.008', 'GRID MASTER v7.010')
@@ -32,23 +31,19 @@ jobs:
           s = s.replace('GRIDMaster v7.008', 'GRIDMaster v7.010')
           s = s.replace('GRIDMaster v7.009', 'GRIDMaster v7.010')
 
-          # Recovery controls.
+          # Recovery controls: recovery must be tied to a genuinely losing basket.
           s = re.sub(r'input double RecoveryConcentrationRatio=[0-9.]+;', 'input double RecoveryConcentrationRatio=0.50;', s, count=1)
           s = re.sub(r'input double GrossLossRecoveryTriggerUSD=[0-9.]+;', 'input double GrossLossRecoveryTriggerUSD=25.0;', s, count=1)
           if 'input double RecoveryNetLossTriggerUSD=' not in s:
-              anchor = 'input double GrossLossRecoveryTriggerUSD=25.0;\n'
-              s = s.replace(anchor, anchor + 'input double RecoveryNetLossTriggerUSD=10.0;\n', 1)
+              s = s.replace('input double GrossLossRecoveryTriggerUSD=25.0;\n', 'input double GrossLossRecoveryTriggerUSD=25.0;\ninput double RecoveryNetLossTriggerUSD=10.0;\n', 1)
           if 'input double RecoveryPartialClosePercent=' not in s:
-              anchor = 'input double RecoveryNetLossTriggerUSD=10.0;\n'
-              s = s.replace(anchor, anchor + 'input double RecoveryPartialClosePercent=50.0;\n', 1)
+              s = s.replace('input double RecoveryNetLossTriggerUSD=10.0;\n', 'input double RecoveryNetLossTriggerUSD=10.0;\ninput double RecoveryPartialClosePercent=50.0;\n', 1)
           if 'input double RecoveryMaxRealizedLossUSD=' not in s:
-              anchor = 'input double RecoveryPartialClosePercent=50.0;\n'
-              s = s.replace(anchor, anchor + 'input double RecoveryMaxRealizedLossUSD=5.0;\n', 1)
+              s = s.replace('input double RecoveryPartialClosePercent=50.0;\n', 'input double RecoveryPartialClosePercent=50.0;\ninput double RecoveryMaxRealizedLossUSD=5.0;\n', 1)
 
-          # Replace RiskRecoveryV4 with a more balanced engine.
+          # Recovery V5: gross loss is not enough by itself. Require DD + net basket loss
+          # + concentration, while stale/swap exits also require a losing basket.
           start = s.find('//================================================================================================//\n// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION')
-          if start < 0:
-              start = s.find('//================================================================================================//\n// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION')
           end_marker = '//================================================================================================//\n// LEGACY RECOVERY GOVERNOR - DD / BASKET TRIGGER'
           end = s.find(end_marker, start)
           if start < 0 or end < 0:
@@ -56,9 +51,6 @@ jobs:
 
           recovery = r'''//================================================================================================//
 // RECOVERY V5 - LOSS BUDGET / STALE / SWAP PROTECTION
-// v7.010: recover earlier, but cap the amount of loss realized by each reduction.
-// Gross recovery requires DD + net basket loss + concentration. Stale/swap recovery
-// remains independent but never fires while the basket is profitable.
 //================================================================================================//
 void RiskRecoveryV4(double dd)
 {
@@ -101,19 +93,15 @@ void RiskRecoveryV4(double dd)
    double ageHours=(oldestLosing>0)?(double)(TimeCurrent()-oldestLosing)/3600.0:0.0;
    double concentration=(grossLoss>0.0)?worstLoss/grossLoss:0.0;
 
+   bool netLossGate=(RecoveryNetLossTriggerUSD<=0.0 || netBasket<=-RecoveryNetLossTriggerUSD);
    bool ddGate=(dd>=RecoveryStartDD);
-   bool basketLossGate=(RecoveryNetLossTriggerUSD<=0.0 || netBasket<=-RecoveryNetLossTriggerUSD);
-   bool grossTrigger=(ddGate && basketLossGate && GrossLossRecoveryTriggerUSD>0.0 && grossLoss>=GrossLossRecoveryTriggerUSD && concentration>=RecoveryConcentrationRatio);
+   bool grossTrigger=(ddGate && netLossGate && GrossLossRecoveryTriggerUSD>0.0 && grossLoss>=GrossLossRecoveryTriggerUSD && concentration>=RecoveryConcentrationRatio);
    bool staleTrigger=(StalePositionHours>0.0 && ageHours>=StalePositionHours && netBasket<0.0);
    bool swapTrigger=(MaxPositionSwapLossUSD>0.0 && worstSwap<=-MaxPositionSwapLossUSD && netBasket<0.0);
 
    if(!(grossTrigger||staleTrigger||swapTrigger)) return;
 
-   string reason="RECOVERY-V5";
-   if(staleTrigger) reason="RECOVERY-STALE";
-   else if(swapTrigger) reason="RECOVERY-SWAP";
-   else reason="RECOVERY-GROSS";
-
+   string reason=staleTrigger?"RECOVERY-STALE":(swapTrigger?"RECOVERY-SWAP":"RECOVERY-GROSS");
    if(ReduceLargestLoser(reason))
    {
       PrintFormat("[RECOVERY V5] %s | gross=%.2f | worst=%.2f | concentration=%.2f | age=%.1fh | swap=%.2f | basket=%.2f | DD=%.2f%%",
@@ -124,7 +112,7 @@ void RiskRecoveryV4(double dd)
 '''
           s = s[:start] + recovery + s[end:]
 
-          # Ensure the legacy governor cannot realize a loss against a profitable basket.
+          # Legacy governor: never realize a side loss while the overall basket is profitable.
           rg_start = s.find('void RecoveryGovernor(double dd)')
           rg_end = s.find('double BasketLoss(ENUM_POSITION_TYPE type)', rg_start)
           if rg_start < 0 or rg_end < 0:
@@ -145,7 +133,7 @@ void RiskRecoveryV4(double dd)
    bool aggressive=dd>=AggressiveRecoveryDD;
    bool survival=dd>=SurvivalDD;
 
-   if(survival)
+   if(survival && basketLossGate)
    {
       CurrentState=STATE_SURVIVAL;
       if(bl>=SurvivalBasketLossUSD&&bl>=sl&&BuyOrders>0)
@@ -181,7 +169,7 @@ void RiskRecoveryV4(double dd)
 '''
           s = s[:rg_start] + governor + s[rg_end:]
 
-          # Replace reduction logic with a realized-loss budget.
+          # Reduction engine: partial close with a realized-loss budget.
           rl_start = s.find('ulong LargestLosingTicket()')
           rl_end = s.find('void SetFreeze()', rl_start)
           if rl_start < 0 or rl_end < 0:
@@ -235,8 +223,6 @@ bool ReduceLargestLoser(string reason)
    if(RecoveryPartialClosePercent>0.0 && RecoveryPartialClosePercent<100.0 && step>0.0 && vol>minVol+1e-10)
    {
       double desired=vol*(RecoveryPartialClosePercent/100.0);
-
-      // Cap the reduction by the maximum realized loss budget.
       if(RecoveryMaxRealizedLossUSD>0.0 && loss>0.0)
       {
          double lossPerLot=loss/vol;
@@ -250,12 +236,7 @@ bool ReduceLargestLoser(string reason)
          closeVol=normalized;
    }
 
-   bool closed=false;
-   if(closeVol<vol-1e-10)
-      closed=ClosePositionVolume(t,closeVol,reason);
-   else
-      closed=ClosePosition(t,reason);
-
+   bool closed=(closeVol<vol-1e-10)?ClosePositionVolume(t,closeVol,reason):ClosePosition(t,reason);
    if(!closed) return false;
 
    ReductionActions++;
@@ -272,17 +253,77 @@ bool ReduceLargestLoser(string reason)
 '''
           s = s[:rl_start] + reduction + s[rl_end:]
 
-          # Safety checks: exactly one implementation of each critical function.
+          # Add partial-close execution if it is not already present.
+          if 'bool ClosePositionVolume(ulong ticket,double volume,string reason)' not in s:
+              marker = 'void SetFreeze()'
+              idx = s.find(marker)
+              if idx < 0:
+                  raise SystemExit('SetFreeze not found')
+              partial = r'''bool ClosePositionVolume(ulong ticket,double volume,string reason)
+{
+   if(ticket==0||volume<=0.0||!PositionSelectByTicket(ticket)) return false;
+   if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade) return false;
+
+   double currentVol=PositionGetDouble(POSITION_VOLUME);
+   if(volume>=currentVol-1e-10) return ClosePosition(ticket,reason);
+
+   double normalized=NormalizeVolume(volume);
+   if(normalized<=0.0||normalized>=currentVol-1e-10) return false;
+
+   ENUM_POSITION_TYPE pt=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ENUM_ORDER_TYPE type=(pt==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+   double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK);
+   if(bid<=0||ask<=0) return false;
+
+   MqlTradeRequest req={};
+   MqlTradeResult res={};
+   req.action=TRADE_ACTION_DEAL;
+   req.position=ticket;
+   req.symbol=SymbolTrade;
+   req.magic=OrdersID;
+   req.volume=normalized;
+   req.type=type;
+   req.price=(type==ORDER_TYPE_BUY)?ask:bid;
+   req.deviation=30;
+   req.type_filling=SafeFilling();
+   req.comment=reason;
+
+   ResetLastError();
+   bool sent=OrderSend(req,res);
+   if(!sent||!TradeOK(res.retcode))
+   {
+      PrintFormat("[PARTIAL CLOSE] FAILED | ticket=%I64u | vol=%.4f | %s | rc=%u | %s | err=%d",ticket,normalized,reason,res.retcode,res.comment,GetLastError());
+      return false;
+   }
+   PrintFormat("[PARTIAL CLOSE] SUCCESS | ticket=%I64u | vol=%.4f | %s | rc=%u",ticket,res.volume,reason,res.retcode);
+   return true;
+}
+
+'''
+              s = s[:idx] + partial + s[idx:]
+
+          # Static safety checks.
+          checks = [
+              '#property version   "7.010"',
+              'RecoveryNetLossTriggerUSD',
+              'RecoveryPartialClosePercent',
+              'RecoveryMaxRealizedLossUSD',
+              'void RiskRecoveryV4(double dd)',
+              'void RecoveryGovernor(double dd)',
+              'bool ReduceLargestLoser(string reason)',
+              'bool ClosePositionVolume(ulong ticket,double volume,string reason)'
+          ]
+          for x in checks:
+              if x not in s:
+                  raise SystemExit('Missing required patch: '+x)
           if s.count('void RiskRecoveryV4(double dd)') != 1:
-              raise SystemExit('RiskRecoveryV4 count check failed')
+              raise SystemExit('RiskRecoveryV4 duplicate')
           if s.count('void RecoveryGovernor(double dd)') != 1:
-              raise SystemExit('RecoveryGovernor count check failed')
+              raise SystemExit('RecoveryGovernor duplicate')
           if s.count('bool ReduceLargestLoser(string reason)') != 1:
-              raise SystemExit('ReduceLargestLoser count check failed')
+              raise SystemExit('ReduceLargestLoser duplicate')
           if s.count('bool ClosePositionVolume(ulong ticket,double volume,string reason)') != 1:
-              raise SystemExit('ClosePositionVolume count check failed')
-          if 'RecoveryMaxRealizedLossUSD' not in s:
-              raise SystemExit('Recovery loss budget input missing')
+              raise SystemExit('ClosePositionVolume duplicate')
 
           p.write_text(s, encoding='utf-8')
 
@@ -293,7 +334,6 @@ bool ReduceLargestLoser(string reason)
           grep -q 'RecoveryNetLossTriggerUSD' GRIDMaster.mq5
           grep -q 'RecoveryPartialClosePercent' GRIDMaster.mq5
           grep -q 'RecoveryMaxRealizedLossUSD' GRIDMaster.mq5
-          grep -q 'void RiskRecoveryV4(double dd)' GRIDMaster.mq5
           grep -q 'bool ClosePositionVolume(ulong ticket,double volume,string reason)' GRIDMaster.mq5
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
