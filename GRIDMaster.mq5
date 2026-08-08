@@ -1,10 +1,10 @@
 //================================================================================================//
 // GRIDMaster - PROFIT PROTECTION / ANOMALY SAFE EDITION 2026
-// v7.001 - PROFIT-PROTECTED GRID + DD GOVERNOR + ANOMALY BRAKE FIX
+// v7.002 - PROFIT-PROTECTED GRID + DD GOVERNOR + RECOVERY/SURVIVAL FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "7.001"
+#property version   "7.002"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum ProtectionState {STATE_NORMAL=0,STATE_MONITOR,STATE_REDUCE,STATE_SURVIVAL,STATE_EMERGENCY,STATE_LOCKED};
@@ -87,6 +87,12 @@ int ReductionActions=0;
 ProtectionState CurrentState=STATE_NORMAL;
 
 //================================================================================================//
+// V7.002 SAFETY CONSTANTS
+//================================================================================================//
+#define SURVIVAL_REENTRY_FREEZE_SEC 120
+#define ANOMALY_RESET_RATIO         0.70
+
+//================================================================================================//
 // THRESHOLDS
 //================================================================================================//
 double HardLimit(){double v=MaxEquityLossPercent;if(v<=0)v=15.0;return MathMin(v,15.0);}
@@ -103,10 +109,10 @@ double ProtectionDD()
 }
 
 //================================================================================================//
-// MARKET HEALTH - ANOMALY BRAKE FIX
-// Cooldown is started only when a NEW anomaly is detected. While the brake is active,
-// repeated ticks cannot extend the cooldown or spam the Journal. Exit/protection engines
-// continue to run independently; the brake only blocks new entries.
+// MARKET HEALTH - V7.002 HYSTERESIS
+// Persistent abnormal spread does not repeatedly create new BRAKE cycles.
+// The latch is released only after spread normalizes below 70% of the trigger.
+// Anomaly protection blocks NEW ENTRY only; exits and DD protection remain active.
 //================================================================================================//
 bool MarketHealthy()
 {
@@ -116,11 +122,12 @@ bool MarketHealthy()
    datetime now=TimeCurrent();
    double spread=(ask-bid)/_Point,mid=(bid+ask)*0.5;
 
-   // Existing brake: do NOT reset/extend the cooldown on every tick.
    if(AnomalyBrakeActive)
    {
       LastMidPrice=mid;
       if(now<AnomalyUntil)return false;
+      double resetSpread=AnomalySpreadPoints*ANOMALY_RESET_RATIO;
+      if(AnomalySpreadPoints>0 && spread>=resetSpread)return false;
       AnomalyBrakeActive=false;
       AnomalyUntil=0;
    }
@@ -139,7 +146,6 @@ bool MarketHealthy()
       AnomalyUntil=now+AnomalyCooldownSec;
       return false;
    }
-
    return true;
 }
 
@@ -164,7 +170,7 @@ int OnInit()
    HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;
    HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;
    if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}
-   PrintFormat("[INIT] GRIDMaster v7.001 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
+   PrintFormat("[INIT] GRIDMaster v7.002 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason){if(HandleRSI!=INVALID_HANDLE)IndicatorRelease(HandleRSI);if(HandleMA!=INVALID_HANDLE)IndicatorRelease(HandleMA);Comment("");}
@@ -183,7 +189,6 @@ void OnTick()
    bool healthy=MarketHealthy();
    if(!healthy&&AnomalyBrakeActive&&LastLogTime!=AnomalyUntil){LastLogTime=AnomalyUntil;PrintFormat("[ANOMALY] BRAKE | Until=%s",TimeToString(AnomalyUntil,TIME_DATE|TIME_SECONDS));}
 
-   // HARD protection is unconditional and always attempts to close.
    if(dd>=HardLimit())HardProtectionActive=true;
    if(HardProtectionActive)
    {
@@ -192,7 +197,6 @@ void OnTick()
       Dashboard(dd);return;
    }
 
-   // Emergency flatten is below the hard cap.
    if(dd>=EmergencyLimit())
    {
       CurrentState=STATE_EMERGENCY;CloseAllManaged("EMERGENCY-DD");UpdateStatus();
@@ -200,7 +204,6 @@ void OnTick()
       Dashboard(dd);return;
    }
 
-   // Profit engine FIRST. This prevents protection logic from destroying profitable baskets.
    ManageProfitExit();UpdateStatus();
    UpdateProtectionState(dd);
    if(UseRecoveryExit)RecoveryGovernor(dd);
@@ -232,7 +235,7 @@ void UpdateStatus()
 }
 
 //================================================================================================//
-// ENTRY ENGINE - keeps the existing signal/grid concept, but hard-blocks new risk during DD/anomaly.
+// ENTRY ENGINE
 //================================================================================================//
 void GridEntryEngine()
 {
@@ -281,9 +284,8 @@ void ExecuteOpen(ENUM_ORDER_TYPE type)
 }
 
 //================================================================================================//
-// PROFIT ENGINE - CRITICAL FIX
-// The old trailing logic could arm at +$5 and later close the entire grid at -$50... 
-// v7 NEVER trails a basket below zero. A positive peak is only allowed to close a still-profitable basket.
+// PROFIT ENGINE
+// Basket trailing/target may close the side only while basket P/L is positive.
 //================================================================================================//
 void ManageProfitExit()
 {
@@ -303,30 +305,56 @@ void UpdateProtectionState(double dd)
 {
    if(BuyOrders+SellOrders==0){CurrentState=STATE_NORMAL;ReductionActions=0;return;}
    if(dd>=EmergencyLimit()){CurrentState=STATE_EMERGENCY;return;}
+   if(dd>=SurvivalDD){CurrentState=STATE_SURVIVAL;return;}
    if(dd>=ReduceLimit()){CurrentState=STATE_REDUCE;return;}
    if(dd>=SoftLimit()){CurrentState=STATE_MONITOR;return;}
    CurrentState=STATE_NORMAL;
 }
 
 //================================================================================================//
-// RECOVERY GOVERNOR
+// RECOVERY GOVERNOR - V7.002
+// Survival reduces ONE losing position, then freezes new exposure and reassesses.
+// It never flattens an entire side merely because the basket loss threshold was hit.
 //================================================================================================//
 void RecoveryGovernor(double dd)
 {
-   if(BuyOrders+SellOrders==0||TimeCurrent()<FreezeGridUntil||(TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec)return;
+   if(BuyOrders+SellOrders==0)return;
+   if(TimeCurrent()<FreezeGridUntil)return;
+   if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec)return;
+
    double bl=BasketLoss(POSITION_TYPE_BUY),sl=BasketLoss(POSITION_TYPE_SELL);
    bool danger=bl>=MaxBasketLossUSD||sl>=MaxBasketLossUSD;
    bool active=dd>=RecoveryStartDD,aggressive=dd>=AggressiveRecoveryDD,survival=dd>=SurvivalDD;
+
    if(survival)
    {
       CurrentState=STATE_SURVIVAL;
-      if(bl>=SurvivalBasketLossUSD&&bl>=sl&&BuyOrders>0){CloseSide(POSITION_TYPE_BUY,"SURVIVAL-BUY");RecoveryActionThisTick=true;SetFreeze();return;}
-      if(sl>=SurvivalBasketLossUSD&&sl>bl&&SellOrders>0){CloseSide(POSITION_TYPE_SELL,"SURVIVAL-SELL");RecoveryActionThisTick=true;SetFreeze();return;}
+      if(ReductionActions>=MaxReductionActions)return;
+      if(bl>=SurvivalBasketLossUSD||sl>=SurvivalBasketLossUSD)
+      {
+         ENUM_POSITION_TYPE side=(bl>=SurvivalBasketLossUSD&&bl>=sl)?POSITION_TYPE_BUY:POSITION_TYPE_SELL;
+         if(ReduceLargestLosingSide(side,"SURVIVAL-REDUCE"))return;
+      }
+      return;
    }
+
    if((danger||active)&&(aggressive||danger)&&ReductionActions<MaxReductionActions)
-   {if(ReduceLargestLoser("RECOVERY"))return;}
+   {
+      if(ReduceLargestLoser("RECOVERY"))
+      {
+         SetRecoveryFreeze();
+         return;
+      }
+   }
+
    if(dd>=SoftLimit()&&(bl>=MinRecoveryLossUSD||sl>=MinRecoveryLossUSD)&&ReductionActions<MaxReductionActions)
-   {if(ReduceLargestLoser("SOFT-DD"))return;}
+   {
+      if(ReduceLargestLoser("SOFT-DD"))
+      {
+         SetRecoveryFreeze();
+         return;
+      }
+   }
 }
 
 double BasketLoss(ENUM_POSITION_TYPE type){double p=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=type)continue;p+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);}return p<0?-p:0;}
@@ -344,15 +372,41 @@ ulong LargestLosingTicket()
    return best;
 }
 
+ulong LargestLosingTicketBySide(ENUM_POSITION_TYPE wantedType)
+{
+   ulong best=0;double bestLoss=0,bestVol=0;datetime oldest=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=wantedType)continue;
+      double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);if(p>=0)continue;
+      double loss=-p,vol=PositionGetDouble(POSITION_VOLUME);datetime ot=(datetime)PositionGetInteger(POSITION_TIME);
+      if(vol>bestVol+1e-8||(MathAbs(vol-bestVol)<=1e-8&&loss>bestLoss+1e-8)||(MathAbs(vol-bestVol)<=1e-8&&MathAbs(loss-bestLoss)<=1e-8&&(oldest==0||ot<oldest))){best=t;bestLoss=loss;bestVol=vol;oldest=ot;}
+   }
+   return best;
+}
+
+void SetRecoveryFreeze(){FreezeGridUntil=TimeCurrent()+(int)MathMax(RecoveryFreezeSec,SURVIVAL_REENTRY_FREEZE_SEC);}
+
+bool ReduceLargestLosingSide(ENUM_POSITION_TYPE type,string reason)
+{
+   ulong t=LargestLosingTicketBySide(type);if(t==0||!PositionSelectByTicket(t))return false;
+   double loss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP)),vol=PositionGetDouble(POSITION_VOLUME);
+   if(!ClosePosition(t,reason))return false;
+   ReductionActions++;LastRecoveryAction=TimeCurrent();SetRecoveryFreeze();RecoveryActionThisTick=true;
+   PrintFormat("[SURVIVAL] REDUCE | ticket=%I64u | side=%s | lot=%.4f | loss=%.2f | action=%d/%d | freeze=%ds",t,EnumToString(type),vol,loss,ReductionActions,MaxReductionActions,(int)MathMax(RecoveryFreezeSec,SURVIVAL_REENTRY_FREEZE_SEC));
+   return true;
+}
+
 bool ReduceLargestLoser(string reason)
 {
    ulong t=LargestLosingTicket();if(t==0||!PositionSelectByTicket(t))return false;
    ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);double loss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));double vol=PositionGetDouble(POSITION_VOLUME);
    if(!ClosePosition(t,reason))return false;
-   ReductionActions++;LastRecoveryAction=TimeCurrent();SetFreeze();RecoveryActionThisTick=true;
-   PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | lot=%.4f | loss=%.2f | action=%d/%d",reason,t,EnumToString(type),vol,loss,ReductionActions,MaxReductionActions);return true;
+   ReductionActions++;LastRecoveryAction=TimeCurrent();SetRecoveryFreeze();RecoveryActionThisTick=true;
+   PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | lot=%.4f | loss=%.2f | action=%d/%d | freeze=%ds",reason,t,EnumToString(type),vol,loss,ReductionActions,MaxReductionActions,(int)MathMax(RecoveryFreezeSec,SURVIVAL_REENTRY_FREEZE_SEC));return true;
 }
-void SetFreeze(){FreezeGridUntil=TimeCurrent()+RecoveryFreezeSec;}
 
 //================================================================================================//
 // CLOSE ENGINE
@@ -390,6 +444,6 @@ string StateText(){if(CurrentState==STATE_MONITOR)return "MONITOR";if(CurrentSta
 void Dashboard(double dd)
 {
    double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;
-   Comment("======== GRIDMaster v7.001 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");
+   Comment("======== GRIDMaster v7.002 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");
 }
 //================================================================================================//
