@@ -15,10 +15,11 @@
 // RECOVERY DIAGNOSTIC LOG FIX
 // HIGH-DD RETRACEMENT BYPASS FIX
 // SURVIVAL LAST POSITION CLOSE FIX
+// EQUITY PROTECTION + RECOVERY + SURVIVAL + ORDER PLACEMENT FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.015"
+#property version   "6.016"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -31,9 +32,9 @@ input double TrailingStopUSD      = 2.0;
 
 input string RSI_Settings         = "||========== INDICATORS ==========||";
 input int    MAPeriod             = 200;
-input int    RSIPeriod             = 14;
-input int    RSIUpper              = 70;
-input int    RSILower              = 30;
+input int    RSIPeriod            = 14;
+input int    RSIUpper             = 70;
+input int    RSILower             = 30;
 
 input string Grid_Settings        = "||========== GRID LOGIC ==========||";
 input Type   TypeOrdersPlace      = Open_Buy_And_Sell;
@@ -67,6 +68,7 @@ double PriceOpenLastBuy, PriceOpenLastSell;
 
 bool     IsTerminated = false;
 bool     HardProtectionActive = false;
+bool     RecoveryActionThisTick = false;
 double   HighWaterMark = 0;
 datetime FreezeGridUntil = 0;
 
@@ -107,6 +109,8 @@ int OnInit()
    LockedProfit = 0;
    CurrentRecoveryState = RECOVERY_OFF;
    HardProtectionActive = false;
+   RecoveryActionThisTick = false;
+   FreezeGridUntil = 0;
    if(HandleRSI == INVALID_HANDLE || HandleMA == INVALID_HANDLE)
    {
       Print("Gagal inisialisasi indikator!");
@@ -129,6 +133,7 @@ void OnTick()
    if(IsTerminated)
       return;
 
+   RecoveryActionThisTick = false;
    UpdateStatus();
 
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -177,11 +182,31 @@ void OnTick()
    RecoveryExitEngine(currentDrawdown);
    UpdateStatus();
 
+   // A successful recovery close must never be followed by a new entry on the same tick.
+   if(RecoveryActionThisTick)
+   {
+      PrintFormat("[ORDER BLOCK] Recovery action executed this tick | FreezeUntil=%s | State=%s", TimeToString(FreezeGridUntil, TIME_DATE|TIME_SECONDS), CurrentRecoveryState == RECOVERY_COOLDOWN ? "COOLDOWN" : "SURVIVAL" );
+      DisplayDashboard(currentDrawdown, GetRSIValue(), IsInRecovery);
+      return;
+   }
+
    double rsi = GetRSIValue();
    double ma  = GetMAValue();
    double price = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
 
-   if(IsTradingHour() && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) && CurrentRecoveryState == RECOVERY_OFF)
+   // ORDER PLACEMENT HARD GATE:
+   // Hard protection, recovery states and recovery freeze all block NEW orders.
+   // Freeze is checked BEFORE initial-entry logic as well as grid-addition logic.
+   bool orderPlacementAllowed =
+      !HardProtectionActive &&
+      !IsTerminated &&
+      CurrentRecoveryState == RECOVERY_OFF &&
+      TimeCurrent() >= FreezeGridUntil &&
+      IsTradingHour() &&
+      TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
+      MQLInfoInteger(MQL_TRADE_ALLOWED);
+
+   if(orderPlacementAllowed)
    {
       int lowRSI  = IsInRecovery ? (RSILower - 5) : RSILower;
       int highRSI = IsInRecovery ? (RSIUpper + 5) : RSIUpper;
@@ -194,21 +219,23 @@ void OnTick()
       if(SellOrders == 0 && (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Sell))
          if(price < ma && rsi > highRSI) canOpenSell = true;
 
-      if(TimeCurrent() >= FreezeGridUntil)
+      if(BuyOrders > 0 && BuyOrders < MaxOrders)
       {
-         if(BuyOrders > 0 && BuyOrders < MaxOrders)
-         {
-            double gap = PointsForFirstGap * MathPow(GapMultiplier, BuyOrders - 1);
-            if(SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) <= PriceOpenLastBuy - (gap * _Point)) canOpenBuy = true;
-         }
-         if(SellOrders > 0 && SellOrders < MaxOrders)
-         {
-            double gap = PointsForFirstGap * MathPow(GapMultiplier, SellOrders - 1);
-            if(price >= PriceOpenLastSell + (gap * _Point)) canOpenSell = true;
-         }
+         double gap = PointsForFirstGap * MathPow(GapMultiplier, BuyOrders - 1);
+         if(SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) <= PriceOpenLastBuy - (gap * _Point)) canOpenBuy = true;
       }
+      if(SellOrders > 0 && SellOrders < MaxOrders)
+      {
+         double gap = PointsForFirstGap * MathPow(GapMultiplier, SellOrders - 1);
+         if(price >= PriceOpenLastSell + (gap * _Point)) canOpenSell = true;
+      }
+
       if(canOpenBuy) ExecuteTrade(ORDER_TYPE_BUY);
       if(canOpenSell) ExecuteTrade(ORDER_TYPE_SELL);
+   }
+   else if(TimeCurrent() < FreezeGridUntil && CurrentRecoveryState == RECOVERY_OFF)
+   {
+      PrintFormat("[ORDER BLOCK] Recovery freeze active | Until=%s | DD=%.2f%%", TimeToString(FreezeGridUntil, TIME_DATE|TIME_SECONDS), currentDrawdown);
    }
 
    DisplayDashboard(currentDrawdown, rsi, IsInRecovery);
@@ -547,6 +574,7 @@ bool CloseRecoveryPosition(ulong ticket)
    {
       LastRecoveryAction = TimeCurrent();
       FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
+      RecoveryActionThisTick = true;
       double exposureAfter = GetRecoveryExposure(type);
       double exposureReduced = exposureBefore - exposureAfter;
       PrintFormat("[REE] Exposure Reduced #%I64u | Side=%s | Requested=%.8f | ActualReduced=%.8f | Exposure %.8f -> %.8f | RetCode=%u", ticket, EnumToString(type), volume, exposureReduced, exposureBefore, exposureAfter, res.retcode);
@@ -567,10 +595,6 @@ void RecoveryExitEngine(double currentDrawdown)
    double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID), ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
    if(bid <= 0 || ask <= 0) return;
 
-   // HIGH-DD RULE:
-   // Normal recovery (DD < SurvivalDD) still waits for the configured retracement.
-   // Survival recovery (DD >= SurvivalDD) MUST reduce exposure immediately.
-   // This removes the dangerous dependency on a 500-point retracement while the account is already under severe DD.
    bool survivalMode = (currentDrawdown >= SurvivalDD);
 
    PrintFormat("[RECOVERY] EVALUATE | DD=%.2f%% | State=%s | BUY=%d SELL=%d | Exposure BUY=%.8f SELL=%.8f | BasketLoss BUY=%.2f SELL=%.2f | Survival=%s", currentDrawdown, CurrentRecoveryState == RECOVERY_ACTIVE ? "ACTIVE" : "MONITOR", BuyOrders, SellOrders, GetRecoveryExposure(POSITION_TYPE_BUY), GetRecoveryExposure(POSITION_TYPE_SELL), GetRecoveryBasketLoss(POSITION_TYPE_BUY), GetRecoveryBasketLoss(POSITION_TYPE_SELL), survivalMode ? "ON" : "OFF");
@@ -583,7 +607,6 @@ void RecoveryExitEngine(double currentDrawdown)
 
       if(survivalMode)
       {
-         // At SurvivalDD, do not wait for price to retrace. Reduce losing exposure now.
          reductionTrigger = true;
          if(lastPositionSurvival)
             PrintFormat("[RECOVERY] BUY LAST POSITION SURVIVAL CLOSE | DD=%.2f%% >= SurvivalDD=%.2f%% | Retracement BYPASSED | Loss=%.2f", currentDrawdown, SurvivalDD, -BuyProfits);
@@ -621,8 +644,8 @@ void RecoveryExitEngine(double currentDrawdown)
                LowestPriceAfterBuy = bid;
                if(lastPositionSurvival)
                {
-                  CurrentRecoveryState = RECOVERY_OFF;
-                  PrintFormat("[RECOVERY] BUY LAST POSITION CLOSED | DD=%.2f%% | Loss=%.2f | Exposure %.8f -> %.8f | Survival=ON", currentDrawdown, -BuyProfits, exposureBefore, GetRecoveryExposure(POSITION_TYPE_BUY));
+                  CurrentRecoveryState = RECOVERY_COOLDOWN;
+                  PrintFormat("[RECOVERY] BUY LAST POSITION CLOSED | DD=%.2f%% | Loss=%.2f | Exposure %.8f -> %.8f | Survival=ON | New entries blocked until %s", currentDrawdown, -BuyProfits, exposureBefore, GetRecoveryExposure(POSITION_TYPE_BUY), TimeToString(FreezeGridUntil, TIME_DATE|TIME_SECONDS));
                }
                else
                {
@@ -645,7 +668,6 @@ void RecoveryExitEngine(double currentDrawdown)
 
       if(survivalMode)
       {
-         // At SurvivalDD, do not wait for price to retrace. Reduce losing exposure now.
          reductionTrigger = true;
          if(lastPositionSurvival)
             PrintFormat("[RECOVERY] SELL LAST POSITION SURVIVAL CLOSE | DD=%.2f%% >= SurvivalDD=%.2f%% | Retracement BYPASSED | Loss=%.2f", currentDrawdown, SurvivalDD, -SellProfits);
@@ -683,8 +705,8 @@ void RecoveryExitEngine(double currentDrawdown)
                HighestPriceAfterSell = ask;
                if(lastPositionSurvival)
                {
-                  CurrentRecoveryState = RECOVERY_OFF;
-                  PrintFormat("[RECOVERY] SELL LAST POSITION CLOSED | DD=%.2f%% | Loss=%.2f | Exposure %.8f -> %.8f | Survival=ON", currentDrawdown, -SellProfits, exposureBefore, GetRecoveryExposure(POSITION_TYPE_SELL));
+                  CurrentRecoveryState = RECOVERY_COOLDOWN;
+                  PrintFormat("[RECOVERY] SELL LAST POSITION CLOSED | DD=%.2f%% | Loss=%.2f | Exposure %.8f -> %.8f | Survival=ON | New entries blocked until %s", currentDrawdown, -SellProfits, exposureBefore, GetRecoveryExposure(POSITION_TYPE_SELL), TimeToString(FreezeGridUntil, TIME_DATE|TIME_SECONDS));
                }
                else
                {
