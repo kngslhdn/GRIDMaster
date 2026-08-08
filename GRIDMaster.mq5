@@ -2,20 +2,14 @@
 // Expert Advisor: A New Grid V1 - RECOVERY & GROWTH EDITION 2026
 // Adaptive Equity Scaling Edition
 // 24/7 EXIT & PROTECTION FIX
+// TRAILING STATE FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.002"
+#property version   "6.003"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
-
-enum RecoveryState
-{
-   RECOVERY_OFF = 0,
-   RECOVERY_MONITOR,
-   RECOVERY_ACTIVE,
-   RECOVERY_COOLDOWN
-};
+enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
 
 input string SafeParameters       = "||========== SAFETY & RECOVERY ==========||";
 input double MaxEquityLossPercent = 15.0;
@@ -82,7 +76,6 @@ bool IsTradingHour()
 
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
-
    int hour = dt.hour;
 
    if(StartHour < EndHour)
@@ -95,7 +88,6 @@ bool IsTradingHour()
 int OnInit()
 {
    SymbolTrade = _Symbol;
-
    OrdersID = (MagicNumber == 0) ? 101010 : MagicNumber;
 
    HandleRSI = iRSI(SymbolTrade, PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE);
@@ -153,8 +145,7 @@ void OnTick()
 
    if(AdaptiveEquityBase > 0 && equity < AdaptiveEquityBase)
    {
-      currentDrawdown =
-         ((AdaptiveEquityBase - equity) / AdaptiveEquityBase) * 100.0;
+      currentDrawdown = ((AdaptiveEquityBase - equity) / AdaptiveEquityBase) * 100.0;
    }
 
    if(currentDrawdown >= MaxEquityLossPercent)
@@ -172,8 +163,7 @@ void OnTick()
       }
       else
       {
-         PrintFormat("[PROTECTION] Close incomplete. BUY=%d SELL=%d. Retrying on next tick.",
-                     BuyOrders, SellOrders);
+         PrintFormat("[PROTECTION] Close incomplete. BUY=%d SELL=%d. Retrying on next tick.", BuyOrders, SellOrders);
       }
 
       DisplayDashboard(currentDrawdown, GetRSIValue(), IsInRecovery);
@@ -194,9 +184,7 @@ void OnTick()
    //========================================================
    // NEW ENTRY / GRID LOGIC - trading hours apply ONLY here
    //========================================================
-   if(IsTradingHour() &&
-      TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
-      MQLInfoInteger(MQL_TRADE_ALLOWED))
+   if(IsTradingHour() && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
       int lowRSI  = IsInRecovery ? (RSILower - 5) : RSILower;
       int highRSI = IsInRecovery ? (RSIUpper + 5) : RSIUpper;
@@ -204,15 +192,13 @@ void OnTick()
       bool canOpenBuy  = false;
       bool canOpenSell = false;
 
-      if(BuyOrders == 0 &&
-         (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Buy))
+      if(BuyOrders == 0 && (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Buy))
       {
          if(price > ma && rsi < lowRSI)
             canOpenBuy = true;
       }
 
-      if(SellOrders == 0 &&
-         (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Sell))
+      if(SellOrders == 0 && (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Sell))
       {
          if(price < ma && rsi > highRSI)
             canOpenSell = true;
@@ -225,18 +211,13 @@ void OnTick()
          if(BuyOrders > 0 && BuyOrders < MaxOrders)
          {
             double gap = PointsForFirstGap * MathPow(GapMultiplier, BuyOrders - 1);
-
-            if(SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) <=
-               PriceOpenLastBuy - (gap * _Point))
-            {
+            if(SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) <= PriceOpenLastBuy - (gap * _Point))
                canOpenBuy = true;
-            }
          }
 
          if(SellOrders > 0 && SellOrders < MaxOrders)
          {
             double gap = PointsForFirstGap * MathPow(GapMultiplier, SellOrders - 1);
-
             if(price >= PriceOpenLastSell + (gap * _Point))
                canOpenSell = true;
          }
@@ -257,54 +238,63 @@ void ManageExit(bool recovery)
 {
    double target = recovery ? (TargetProfitUSD + 2.0) : TargetProfitUSD;
 
+   //========================================================
+   // TRAILING STATE RULE
+   // Once a basket reaches TrailingStartUSD, its peak profit
+   // remains armed until that basket is actually closed.
+   // The current profit may fall BELOW TrailingStartUSD and
+   // must still trigger the trailing stop.
+   //========================================================
+
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
    if(SellOrders == 0)
       MaxSellProfitSeen = 0;
 
+   //================ BUY EXIT =================
    if(BuyOrders > 0)
    {
       if(!UseTrailingProfit)
       {
          if(BuyProfits >= target)
-         {
             CloseOrdersByType(POSITION_TYPE_BUY);
-            MaxBuyProfitSeen = 0;
-         }
       }
-      else if(BuyProfits >= TrailingStartUSD)
+      else
       {
-         if(BuyProfits > MaxBuyProfitSeen)
+         // Arm trailing once profit reaches the start threshold.
+         if(BuyProfits >= TrailingStartUSD && BuyProfits > MaxBuyProfitSeen)
             MaxBuyProfitSeen = BuyProfits;
 
-         if(BuyProfits <= MaxBuyProfitSeen - TrailingStopUSD)
+         // IMPORTANT: do NOT require BuyProfits >= TrailingStartUSD here.
+         // A retrace below the start level must still close the basket.
+         if(MaxBuyProfitSeen >= TrailingStartUSD &&
+            BuyProfits <= MaxBuyProfitSeen - TrailingStopUSD)
          {
             CloseOrdersByType(POSITION_TYPE_BUY);
-            MaxBuyProfitSeen = 0;
          }
       }
    }
 
+   //================ SELL EXIT =================
    if(SellOrders > 0)
    {
       if(!UseTrailingProfit)
       {
          if(SellProfits >= target)
-         {
             CloseOrdersByType(POSITION_TYPE_SELL);
-            MaxSellProfitSeen = 0;
-         }
       }
-      else if(SellProfits >= TrailingStartUSD)
+      else
       {
-         if(SellProfits > MaxSellProfitSeen)
+         // Arm trailing once profit reaches the start threshold.
+         if(SellProfits >= TrailingStartUSD && SellProfits > MaxSellProfitSeen)
             MaxSellProfitSeen = SellProfits;
 
-         if(SellProfits <= MaxSellProfitSeen - TrailingStopUSD)
+         // IMPORTANT: do NOT require SellProfits >= TrailingStartUSD here.
+         if(MaxSellProfitSeen >= TrailingStartUSD &&
+            SellProfits <= MaxSellProfitSeen - TrailingStopUSD)
          {
             CloseOrdersByType(POSITION_TYPE_SELL);
-            MaxSellProfitSeen = 0;
          }
       }
    }
@@ -333,9 +323,7 @@ void UpdateStatus()
       if(PositionGetString(POSITION_SYMBOL) != SymbolTrade)
          continue;
 
-      ENUM_POSITION_TYPE type =
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
 
       if(type == POSITION_TYPE_BUY)
@@ -352,6 +340,7 @@ void UpdateStatus()
       }
    }
 
+   // Reset trailing state ONLY when that basket is actually gone.
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
@@ -364,7 +353,6 @@ double GetRSIValue()
 {
    double b[];
    ArraySetAsSeries(b, true);
-
    return (CopyBuffer(HandleRSI, 0, 0, 1, b) > 0) ? b[0] : 50.0;
 }
 
@@ -373,7 +361,6 @@ double GetMAValue()
 {
    double b[];
    ArraySetAsSeries(b, true);
-
    return (CopyBuffer(HandleMA, 0, 0, 1, b) > 0) ? b[0] : 0;
 }
 
@@ -393,35 +380,26 @@ void ExecuteTrade(ENUM_ORDER_TYPE type)
    req.deviation = 10;
    req.type_filling = ORDER_FILLING_IOC;
    req.comment = CommentsOrders;
-
-   req.price = (type == ORDER_TYPE_BUY)
-      ? SymbolInfoDouble(SymbolTrade, SYMBOL_ASK)
-      : SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
+   req.price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
 
    ResetLastError();
 
    if(!OrderSend(req, res))
    {
-      PrintFormat("Gagal membuka %s. Error=%d RetCode=%u Comment=%s",
-                  EnumToString(type), GetLastError(), res.retcode, res.comment);
+      PrintFormat("Gagal membuka %s. Error=%d RetCode=%u Comment=%s", EnumToString(type), GetLastError(), res.retcode, res.comment);
       return;
    }
 
-   if(res.retcode != TRADE_RETCODE_DONE &&
-      res.retcode != TRADE_RETCODE_DONE_PARTIAL &&
-      res.retcode != TRADE_RETCODE_PLACED)
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL && res.retcode != TRADE_RETCODE_PLACED)
    {
-      PrintFormat("Open %s rejected. RetCode=%u Comment=%s",
-                  EnumToString(type), res.retcode, res.comment);
+      PrintFormat("Open %s rejected. RetCode=%u Comment=%s", EnumToString(type), res.retcode, res.comment);
    }
 }
 
 //================================================================================================//
 bool IsCloseRetcodeSuccess(uint retcode)
 {
-   return (retcode == TRADE_RETCODE_DONE ||
-           retcode == TRADE_RETCODE_DONE_PARTIAL ||
-           retcode == TRADE_RETCODE_PLACED);
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED);
 }
 
 //================================================================================================//
@@ -452,20 +430,16 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
       req.magic = OrdersID;
       req.volume = PositionGetDouble(POSITION_VOLUME);
       req.type = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-      req.price = (type == POSITION_TYPE_BUY)
-         ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID)
-         : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+      req.price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
       req.deviation = 10;
       req.type_filling = ORDER_FILLING_IOC;
 
       ResetLastError();
-
       bool sent = OrderSend(req, res);
 
       if(!sent || !IsCloseRetcodeSuccess(res.retcode))
       {
-         PrintFormat("Gagal menutup tiket #%I64u. Sent=%s RetCode=%u Comment=%s Error=%d",
-                     t, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
+         PrintFormat("Gagal menutup tiket #%I64u. Sent=%s RetCode=%u Comment=%s Error=%d", t, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
       }
       else
       {
@@ -487,23 +461,17 @@ ulong FindBestRecoveryPosition(ENUM_POSITION_TYPE type)
    ulong bestTicket = 0;
    double bestScore = -DBL_MAX;
 
-   double currentPrice = (type == POSITION_TYPE_BUY)
-      ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID)
-      : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+   double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-
       if(!PositionSelectByTicket(ticket))
          continue;
-
       if(PositionGetInteger(POSITION_MAGIC) != OrdersID)
          continue;
-
       if(PositionGetString(POSITION_SYMBOL) != SymbolTrade)
          continue;
-
       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != type)
          continue;
 
@@ -532,12 +500,10 @@ bool CloseRecoveryPosition(ulong ticket)
    if(ticket == 0 || !PositionSelectByTicket(ticket))
       return false;
 
-   if(PositionGetInteger(POSITION_MAGIC) != OrdersID ||
-      PositionGetString(POSITION_SYMBOL) != SymbolTrade)
+   if(PositionGetInteger(POSITION_MAGIC) != OrdersID || PositionGetString(POSITION_SYMBOL) != SymbolTrade)
       return false;
 
-   ENUM_POSITION_TYPE type =
-      (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
@@ -548,28 +514,22 @@ bool CloseRecoveryPosition(ulong ticket)
    req.magic = OrdersID;
    req.volume = PositionGetDouble(POSITION_VOLUME);
    req.type = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   req.price = (type == POSITION_TYPE_BUY)
-      ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID)
-      : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+   req.price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
    req.deviation = 10;
    req.type_filling = ORDER_FILLING_IOC;
 
    ResetLastError();
-
    bool sent = OrderSend(req, res);
 
    if(sent && IsCloseRetcodeSuccess(res.retcode))
    {
       LastRecoveryAction = TimeCurrent();
       FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
-
       PrintFormat("[REE] Recovery Close Success #%I64u RetCode=%u", ticket, res.retcode);
       return true;
    }
 
-   PrintFormat("[REE] Recovery Close Failed #%I64u | Sent=%s | RetCode=%u | Comment=%s | Error=%d",
-               ticket, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
-
+   PrintFormat("[REE] Recovery Close Failed #%I64u | Sent=%s | RetCode=%u | Comment=%s | Error=%d", ticket, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
    return false;
 }
 
@@ -596,7 +556,6 @@ void RecoveryExitEngine(double currentDrawdown)
    {
       if(LowestPriceAfterBuy == 0)
          LowestPriceAfterBuy = bid;
-
       if(bid < LowestPriceAfterBuy)
          LowestPriceAfterBuy = bid;
 
@@ -605,7 +564,6 @@ void RecoveryExitEngine(double currentDrawdown)
       if(retrace >= RetraceTriggerPoints)
       {
          PrintFormat("[REE] BUY Retracement Detected : %.0f points", retrace);
-
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_BUY);
 
          if(ticket > 0 && BuyOrders > 2)
@@ -624,7 +582,6 @@ void RecoveryExitEngine(double currentDrawdown)
    {
       if(HighestPriceAfterSell == 0)
          HighestPriceAfterSell = ask;
-
       if(ask > HighestPriceAfterSell)
          HighestPriceAfterSell = ask;
 
@@ -633,7 +590,6 @@ void RecoveryExitEngine(double currentDrawdown)
       if(retrace >= RetraceTriggerPoints)
       {
          PrintFormat("[REE] SELL Retracement Detected : %.0f points", retrace);
-
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_SELL);
 
          if(ticket > 0 && SellOrders > 2)
