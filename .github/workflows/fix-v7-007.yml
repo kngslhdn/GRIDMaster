@@ -1,0 +1,62 @@
+name: GRIDMaster v7.007 recovery fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-v7-007.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch Recovery V3
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('GRIDMaster.mq5')
+          s = p.read_text(encoding='utf-8')
+
+          s = s.replace('v7.006 - RECOVERY V2 + SAFE BASKET CLOSE ENGINE + CATASTROPHIC PROTECTION',
+                        'v7.007 - RECOVERY V3 + LOSS-TRIGGERED RECOVERY + SAFE BASKET CLOSE')
+          s = s.replace('#property version "7.006"', '#property version "7.007"')
+
+          s = s.replace('input double MinRecoveryLossUSD=20.0;\n',
+                        'input double MinRecoveryLossUSD=20.0;\ninput double RecoveryLossTriggerUSD=20.0;\ninput double RecoveryDistributedLossTriggerUSD=30.0;\n')
+
+          old = '''   if(dd<RecoveryStartDD)return;\n   if(basketLoss<MinRecoveryLossUSD)return;\n\n   ulong loser=LargestLosingTicket();\n   if(loser==0||!PositionSelectByTicket(loser))return;\n   double largestLoss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));\n   double concentration=(basketLoss>0.0)?largestLoss/basketLoss:0.0;\n   // At normal recovery DD, only cut a position that materially dominates risk.\n   // At aggressive DD, allow reduction even when losses are distributed.\n   if(dd<AggressiveRecoveryDD&&concentration<RecoveryConcentrationRatio)return;\n\n   if(ReduceLargestLoser("RECOVERY"))return;'''
+
+          new = '''   // V3: recovery can be triggered by floating basket loss even when equity DD\n   // has not reached RecoveryStartDD. This prevents a $20-$60 basket loss from\n   // bypassing recovery simply because a profitable hedge keeps account DD low.\n   bool lossTrigger=(RecoveryLossTriggerUSD>0.0&&basketLoss>=RecoveryLossTriggerUSD);\n   bool ddTrigger=(dd>=RecoveryStartDD);\n   if(!lossTrigger&&!ddTrigger)return;\n\n   // Do not cut tiny distributed losses. If DD is still below aggressive mode,\n   // require either a concentrated loser or a larger distributed basket loss.\n   if(basketLoss<MinRecoveryLossUSD)return;\n\n   ulong loser=LargestLosingTicket();\n   if(loser==0||!PositionSelectByTicket(loser))return;\n   double largestLoss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));\n   double concentration=(basketLoss>0.0)?largestLoss/basketLoss:0.0;\n   if(dd<AggressiveRecoveryDD && concentration<RecoveryConcentrationRatio &&\n      basketLoss<RecoveryDistributedLossTriggerUSD)return;\n\n   if(ReduceLargestLoser(lossTrigger?"RECOVERY-LOSS-TRIGGER":"RECOVERY-DD"))return;'''
+
+          if old not in s:
+              raise SystemExit('Recovery block not found; aborting without changes')
+          s = s.replace(old, new, 1)
+
+          old_close = '''void CloseAllManaged(string reason){\n   // Re-snapshot before every close. This avoids stale ticket/volume state and\n   // makes the basket close resilient to partial fills and fast XAUUSD ticks.\n   for(int pass=0;pass<20;pass++){\n      UpdateStatus();\n      if(BuyOrders+SellOrders==0)return;\n      bool changed=false;\n      if(CloseBestAvailable(reason,true))changed=true;\n      else if(CloseBestAvailable(reason,false))changed=true;\n      if(!changed)break;\n   }\n   UpdateStatus();\n   if(BuyOrders+SellOrders>0)\n      PrintFormat("[CLOSE] BASKET INCOMPLETE | reason=%s | BUY=%d | SELL=%d | floating=%.2f",reason,BuyOrders,SellOrders,BuyProfits+SellProfits);\n}'''
+
+          new_close = '''void CloseAllManaged(string reason){\n   // Re-snapshot before every close. For protection/recovery exits, close the\n   // largest losing exposure first so a profitable hedge is not removed before\n   // the risk that triggered protection. For normal basket-profit exits, bank\n   // profitable exposure first.\n   bool protection=(StringFind(reason,"MAX-BASKET")>=0 || StringFind(reason,"CATASTROPHIC")>=0 ||\n                    StringFind(reason,"EMERGENCY")>=0 || StringFind(reason,"HARD-DD")>=0 ||\n                    StringFind(reason,"SURVIVAL")>=0 || StringFind(reason,"RECOVERY")>=0);\n   for(int pass=0;pass<20;pass++){\n      UpdateStatus();\n      if(BuyOrders+SellOrders==0)return;\n      bool changed=false;\n      if(protection){\n         if(CloseBestAvailable(reason,false))changed=true;\n         else if(CloseBestAvailable(reason,true))changed=true;\n      }else{\n         if(CloseBestAvailable(reason,true))changed=true;\n         else if(CloseBestAvailable(reason,false))changed=true;\n      }\n      if(!changed)break;\n   }\n   UpdateStatus();\n   if(BuyOrders+SellOrders>0)\n      PrintFormat("[CLOSE] BASKET INCOMPLETE | reason=%s | BUY=%d | SELL=%d | floating=%.2f",reason,BuyOrders,SellOrders,BuyProfits+SellProfits);\n}'''
+
+          if old_close not in s:
+              raise SystemExit('CloseAllManaged block not found; aborting without changes')
+          s = s.replace(old_close, new_close, 1)
+
+          s = s.replace('GRIDMaster v7.006','GRIDMaster v7.007')
+          p.write_text(s, encoding='utf-8')
+
+          # Remove this temporary workflow after the patch so it cannot run again.
+          wf = Path('.github/workflows/fix-v7-007.yml')
+          wf.unlink()
+
+      - name: Commit v7.007
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GRIDMaster.mq5 .github/workflows/fix-v7-007.yml
+          git commit -m 'Fix recovery loss trigger and protection basket close' || exit 0
+          git push
