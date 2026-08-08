@@ -6,10 +6,11 @@
 // LAST GRID PRICE FIX
 // TRADE RESULT VALIDATION FIX
 // SYMBOL / FILLING / VOLUME SAFETY FIX
+// RECOVERY REDUCE EXPOSURE FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.006"
+#property version   "6.007"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -22,9 +23,9 @@ input double TrailingStopUSD      = 2.0;
 
 input string RSI_Settings         = "||========== INDICATORS ==========||";
 input int    MAPeriod             = 200;
-input int    RSIPeriod             = 14;
-input int    RSIUpper              = 70;
-input int    RSILower              = 30;
+input int    RSIPeriod            = 14;
+input int    RSIUpper             = 70;
+input int    RSILower             = 30;
 
 input string Grid_Settings        = "||========== GRID LOGIC ==========||";
 input Type   TypeOrdersPlace      = Open_Buy_And_Sell;
@@ -63,6 +64,7 @@ datetime FreezeGridUntil = 0;
 datetime LastRecoveryAction = 0;
 double   LowestPriceAfterBuy = 0;
 double   HighestPriceAfterSell = 0;
+RecoveryState CurrentRecoveryState = RECOVERY_OFF;
 
 double InitialBalance = 0;
 double AdaptiveEquityBase = 0;
@@ -99,6 +101,7 @@ int OnInit()
    InitialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    AdaptiveEquityBase = InitialBalance;
    LockedProfit = 0;
+   CurrentRecoveryState = RECOVERY_OFF;
 
    if(HandleRSI == INVALID_HANDLE || HandleMA == INVALID_HANDLE)
    {
@@ -140,14 +143,13 @@ void OnTick()
 
    bool IsInRecovery = (balance < HighWaterMark);
 
-   //========================================================
-   // 24/7 EQUITY PROTECTION
-   //========================================================
    double currentDrawdown = 0;
-
    if(AdaptiveEquityBase > 0 && equity < AdaptiveEquityBase)
       currentDrawdown = ((AdaptiveEquityBase - equity) / AdaptiveEquityBase) * 100.0;
 
+   //========================================================
+   // 24/7 EQUITY PROTECTION
+   //========================================================
    if(currentDrawdown >= MaxEquityLossPercent)
    {
       PrintFormat("!!! EMERGENCY CUT LOSS: Drawdown %.2f%% !!!", currentDrawdown);
@@ -158,6 +160,7 @@ void OnTick()
       if(BuyOrders == 0 && SellOrders == 0)
       {
          IsTerminated = true;
+         CurrentRecoveryState = RECOVERY_OFF;
          Print("[PROTECTION] All managed positions closed. EA terminated for safety.");
       }
       else
@@ -170,8 +173,9 @@ void OnTick()
    }
 
    //========================================================
-   // 24/7 EXIT ENGINES - NEVER gated by trading hours
+   // RECOVERY STATE / EXIT ENGINES - 24/7
    //========================================================
+   UpdateRecoveryState(currentDrawdown);
    ManageExit(IsInRecovery);
    RecoveryExitEngine(currentDrawdown);
    UpdateStatus();
@@ -182,8 +186,12 @@ void OnTick()
 
    //========================================================
    // NEW ENTRY / GRID LOGIC - trading hours apply ONLY here
+   // Recovery state ALWAYS blocks new exposure.
    //========================================================
-   if(IsTradingHour() && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED))
+   if(IsTradingHour() &&
+      TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
+      MQLInfoInteger(MQL_TRADE_ALLOWED) &&
+      CurrentRecoveryState == RECOVERY_OFF)
    {
       int lowRSI  = IsInRecovery ? (RSILower - 5) : RSILower;
       int highRSI = IsInRecovery ? (RSIUpper + 5) : RSIUpper;
@@ -191,21 +199,21 @@ void OnTick()
       bool canOpenBuy  = false;
       bool canOpenSell = false;
 
-      if(BuyOrders == 0 && (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Buy))
+      if(BuyOrders == 0 &&
+         (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Buy))
       {
          if(price > ma && rsi < lowRSI)
             canOpenBuy = true;
       }
 
-      if(SellOrders == 0 && (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Sell))
+      if(SellOrders == 0 &&
+         (TypeOrdersPlace == Open_Buy_And_Sell || TypeOrdersPlace == Open__Only_Sell))
       {
          if(price < ma && rsi > highRSI)
             canOpenSell = true;
       }
 
-      bool GridFreeze = (TimeCurrent() < FreezeGridUntil);
-
-      if(!GridFreeze)
+      if(TimeCurrent() >= FreezeGridUntil)
       {
          if(BuyOrders > 0 && BuyOrders < MaxOrders)
          {
@@ -233,6 +241,52 @@ void OnTick()
 }
 
 //================================================================================================//
+void UpdateRecoveryState(double currentDrawdown)
+{
+   if(!UseRecoveryExit || BuyOrders + SellOrders == 0)
+   {
+      CurrentRecoveryState = RECOVERY_OFF;
+      LowestPriceAfterBuy = 0;
+      HighestPriceAfterSell = 0;
+      return;
+   }
+
+   // Recovery stays active while DD is at or above the recovery threshold.
+   // This permanently blocks new grid exposure until the basket recovers.
+   if(currentDrawdown >= RecoveryStartDD)
+   {
+      if(CurrentRecoveryState == RECOVERY_OFF || CurrentRecoveryState == RECOVERY_COOLDOWN)
+      {
+         CurrentRecoveryState = RECOVERY_MONITOR;
+         PrintFormat("[RECOVERY] ACTIVATED | DD=%.2f%% | Grid entries frozen", currentDrawdown);
+      }
+
+      if(CurrentRecoveryState == RECOVERY_MONITOR &&
+         (BuyOrders >= 2 || SellOrders >= 2))
+      {
+         CurrentRecoveryState = RECOVERY_ACTIVE;
+      }
+
+      return;
+   }
+
+   // After a successful reduction, keep the grid frozen for the configured cooldown.
+   if(CurrentRecoveryState == RECOVERY_COOLDOWN)
+   {
+      if(TimeCurrent() < FreezeGridUntil)
+         return;
+
+      CurrentRecoveryState = RECOVERY_OFF;
+      Print("[RECOVERY] Cooldown complete. Recovery cleared; normal grid may resume.");
+      return;
+   }
+
+   CurrentRecoveryState = RECOVERY_OFF;
+   LowestPriceAfterBuy = 0;
+   HighestPriceAfterSell = 0;
+}
+
+//================================================================================================//
 void ManageExit(bool recovery)
 {
    double target = recovery ? (TargetProfitUSD + 2.0) : TargetProfitUSD;
@@ -243,7 +297,6 @@ void ManageExit(bool recovery)
    if(SellOrders == 0)
       MaxSellProfitSeen = 0;
 
-   //================ BUY EXIT =================
    if(BuyOrders > 0)
    {
       if(!UseTrailingProfit)
@@ -261,7 +314,6 @@ void ManageExit(bool recovery)
       }
    }
 
-   //================ SELL EXIT =================
    if(SellOrders > 0)
    {
       if(!UseTrailingProfit)
@@ -296,13 +348,10 @@ void UpdateStatus()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-
       if(!PositionSelectByTicket(ticket))
          continue;
-
       if(PositionGetInteger(POSITION_MAGIC) != OrdersID)
          continue;
-
       if(PositionGetString(POSITION_SYMBOL) != SymbolTrade)
          continue;
 
@@ -315,7 +364,6 @@ void UpdateStatus()
       {
          BuyOrders++;
          BuyProfits += p;
-
          if(openTime >= latestBuyTime)
          {
             latestBuyTime = openTime;
@@ -326,7 +374,6 @@ void UpdateStatus()
       {
          SellOrders++;
          SellProfits += p;
-
          if(openTime >= latestSellTime)
          {
             latestSellTime = openTime;
@@ -337,7 +384,6 @@ void UpdateStatus()
 
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
-
    if(SellOrders == 0)
       MaxSellProfitSeen = 0;
 }
@@ -361,7 +407,6 @@ double GetMAValue()
 //================================================================================================//
 bool IsMarketTradeSuccess(uint retcode)
 {
-   // For TRADE_ACTION_DEAL, PLACED is NOT a successful execution result.
    return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL);
 }
 
@@ -369,25 +414,19 @@ bool IsMarketTradeSuccess(uint retcode)
 ENUM_ORDER_TYPE_FILLING GetSafeFillingMode()
 {
    long filling = 0;
-
    if(!SymbolInfoInteger(SymbolTrade, SYMBOL_FILLING_MODE, filling))
    {
       PrintFormat("[SAFETY] Cannot read SYMBOL_FILLING_MODE for %s", SymbolTrade);
       return ORDER_FILLING_FOK;
    }
 
-   // Prefer IOC when the broker/symbol explicitly supports it.
    if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       return ORDER_FILLING_IOC;
-
    if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       return ORDER_FILLING_FOK;
 
-   // RETURN is valid for non-market execution modes. For MARKET execution
-   // it is not allowed, so keep FOK as the safest fallback.
    long execution = 0;
    SymbolInfoInteger(SymbolTrade, SYMBOL_TRADE_EXEMODE, execution);
-
    if(execution != SYMBOL_TRADE_EXECUTION_MARKET)
       return ORDER_FILLING_RETURN;
 
@@ -399,10 +438,8 @@ int GetVolumeDigits()
 {
    double step = SymbolInfoDouble(SymbolTrade, SYMBOL_VOLUME_STEP);
    int digits = 0;
-
    while(digits < 8 && MathAbs(step - NormalizeDouble(step, digits)) > 0.00000001)
       digits++;
-
    return digits;
 }
 
@@ -415,28 +452,22 @@ double NormalizeTradeVolume(double requestedVolume)
 
    if(minVolume <= 0 || maxVolume <= 0 || step <= 0)
    {
-      PrintFormat("[SAFETY] Invalid volume specification for %s | Min=%.8f Max=%.8f Step=%.8f",
-                  SymbolTrade, minVolume, maxVolume, step);
+      PrintFormat("[SAFETY] Invalid volume specification for %s | Min=%.8f Max=%.8f Step=%.8f", SymbolTrade, minVolume, maxVolume, step);
       return 0.0;
    }
 
    if(requestedVolume < minVolume - 0.00000001)
    {
-      PrintFormat("[SAFETY] Requested volume %.8f is below minimum %.8f for %s",
-                  requestedVolume, minVolume, SymbolTrade);
+      PrintFormat("[SAFETY] Requested volume %.8f is below minimum %.8f for %s", requestedVolume, minVolume, SymbolTrade);
       return 0.0;
    }
 
    double volume = MathMin(requestedVolume, maxVolume);
-
-   // Round DOWN to the broker's volume step so we never accidentally
-   // increase the requested risk because of normalization.
    volume = MathFloor((volume + 0.0000000001) / step) * step;
 
    if(volume < minVolume - 0.00000001)
    {
-      PrintFormat("[SAFETY] Normalized volume %.8f became below minimum %.8f for %s",
-                  volume, minVolume, SymbolTrade);
+      PrintFormat("[SAFETY] Normalized volume %.8f became below minimum %.8f for %s", volume, minVolume, SymbolTrade);
       return 0.0;
    }
 
@@ -452,9 +483,7 @@ bool IsTradeEnvironmentSafe(ENUM_ORDER_TYPE type, double &price)
       return false;
    }
 
-   ENUM_SYMBOL_TRADE_MODE tradeMode =
-      (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(SymbolTrade, SYMBOL_TRADE_MODE);
-
+   ENUM_SYMBOL_TRADE_MODE tradeMode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(SymbolTrade, SYMBOL_TRADE_MODE);
    if(tradeMode == SYMBOL_TRADE_MODE_DISABLED || tradeMode == SYMBOL_TRADE_MODE_CLOSEONLY)
    {
       PrintFormat("[SAFETY] Trading disabled/close-only for %s | Mode=%d", SymbolTrade, tradeMode);
@@ -463,7 +492,6 @@ bool IsTradeEnvironmentSafe(ENUM_ORDER_TYPE type, double &price)
 
    double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
    double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
-
    if(bid <= 0 || ask <= 0 || ask < bid)
    {
       PrintFormat("[SAFETY] Invalid market price for %s | Bid=%.8f Ask=%.8f", SymbolTrade, bid, ask);
@@ -471,28 +499,19 @@ bool IsTradeEnvironmentSafe(ENUM_ORDER_TYPE type, double &price)
    }
 
    price = (type == ORDER_TYPE_BUY) ? ask : bid;
-
-   if(price <= 0)
-   {
-      PrintFormat("[SAFETY] Invalid execution price for %s", SymbolTrade);
-      return false;
-   }
-
-   return true;
+   return (price > 0);
 }
 
 //================================================================================================//
 void ExecuteTrade(ENUM_ORDER_TYPE type)
 {
    double price = 0;
-
    if(!IsTradeEnvironmentSafe(type, price))
       return;
 
    int c = (type == ORDER_TYPE_BUY) ? BuyOrders : SellOrders;
    double requestedVolume = ManualLotSize * (c + 1);
    double volume = NormalizeTradeVolume(requestedVolume);
-
    if(volume <= 0)
    {
       PrintFormat("[OPEN] Trade blocked: invalid volume %.8f for %s", requestedVolume, SymbolTrade);
@@ -501,7 +520,6 @@ void ExecuteTrade(ENUM_ORDER_TYPE type)
 
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
-
    req.action = TRADE_ACTION_DEAL;
    req.symbol = SymbolTrade;
    req.magic = OrdersID;
@@ -513,23 +531,19 @@ void ExecuteTrade(ENUM_ORDER_TYPE type)
    req.comment = CommentsOrders;
 
    ResetLastError();
-
    if(!OrderSend(req, res))
    {
-      PrintFormat("[OPEN] OrderSend failed %s | Symbol=%s | Volume=%.8f | Filling=%d | Error=%d | RetCode=%u | Comment=%s",
-                  EnumToString(type), SymbolTrade, volume, req.type_filling, GetLastError(), res.retcode, res.comment);
+      PrintFormat("[OPEN] OrderSend failed %s | Symbol=%s | Volume=%.8f | Filling=%d | Error=%d | RetCode=%u | Comment=%s", EnumToString(type), SymbolTrade, volume, req.type_filling, GetLastError(), res.retcode, res.comment);
       return;
    }
 
    if(!IsMarketTradeSuccess(res.retcode))
    {
-      PrintFormat("[OPEN] Trade rejected %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
-                  EnumToString(type), SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
+      PrintFormat("[OPEN] Trade rejected %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u", EnumToString(type), SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
       return;
    }
 
-   PrintFormat("[OPEN] Trade executed %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
-               EnumToString(type), SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
+   PrintFormat("[OPEN] Trade executed %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u", EnumToString(type), SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
 }
 
 //================================================================================================//
@@ -538,50 +552,35 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong t = PositionGetTicket(i);
-
       if(!PositionSelectByTicket(t))
          continue;
-
       if(PositionGetInteger(POSITION_MAGIC) != OrdersID)
          continue;
-
       if(PositionGetString(POSITION_SYMBOL) != SymbolTrade)
          continue;
-
       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != type)
          continue;
 
       double volume = NormalizeTradeVolume(PositionGetDouble(POSITION_VOLUME));
-
       if(volume <= 0)
       {
          PrintFormat("[CLOSE] Invalid close volume for #%I64u", t);
          continue;
       }
 
-      ENUM_ORDER_TYPE closeType =
-         (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-
+      ENUM_ORDER_TYPE closeType = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
       double price = 0;
       if(!IsTradeEnvironmentSafe(closeType, price))
       {
-         // Close protection must still be attempted when the symbol is in
-         // CLOSEONLY mode. Re-read the actual side price without blocking.
          double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
          double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
-
          if(bid <= 0 || ask <= 0)
-         {
-            PrintFormat("[CLOSE] Cannot close #%I64u: invalid Bid/Ask", t);
             continue;
-         }
-
          price = (closeType == ORDER_TYPE_BUY) ? ask : bid;
       }
 
       MqlTradeRequest req = {};
       MqlTradeResult  res = {};
-
       req.action = TRADE_ACTION_DEAL;
       req.position = t;
       req.symbol = SymbolTrade;
@@ -594,23 +593,13 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
 
       ResetLastError();
       bool sent = OrderSend(req, res);
-
-      if(!sent)
+      if(!sent || !IsMarketTradeSuccess(res.retcode))
       {
-         PrintFormat("[CLOSE] OrderSend failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Error=%d | RetCode=%u | Comment=%s",
-                     t, SymbolTrade, volume, req.type_filling, GetLastError(), res.retcode, res.comment);
+         PrintFormat("[CLOSE] Trade failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Sent=%s | Error=%d | RetCode=%u | Comment=%s", t, SymbolTrade, volume, req.type_filling, sent ? "true" : "false", GetLastError(), res.retcode, res.comment);
          continue;
       }
 
-      if(!IsMarketTradeSuccess(res.retcode))
-      {
-         PrintFormat("[CLOSE] Trade rejected #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
-                     t, SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
-         continue;
-      }
-
-      PrintFormat("[CLOSE] Trade executed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
-                  t, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
+      PrintFormat("[CLOSE] Trade executed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u", t, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
    }
 }
 
@@ -625,9 +614,9 @@ void CloseAllOrders()
 ulong FindBestRecoveryPosition(ENUM_POSITION_TYPE type)
 {
    ulong bestTicket = 0;
-   double bestScore = -DBL_MAX;
-
-   double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+   double worstLoss = 0.0;
+   double bestVolume = 0.0;
+   datetime oldestTime = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -641,20 +630,31 @@ ulong FindBestRecoveryPosition(ENUM_POSITION_TYPE type)
       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != type)
          continue;
 
-      double profit = PositionGetDouble(POSITION_PROFIT);
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
       if(profit >= 0)
          continue;
 
+      double loss = -profit;
       double volume = PositionGetDouble(POSITION_VOLUME);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double distance = MathAbs(currentPrice - openPrice) / _Point;
-      double score = (volume * 1000.0) + distance;
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
 
-      if(score > bestScore)
+      // Prefer the largest absolute floating loss. Volume and age are only tie-breakers.
+      if(loss > worstLoss + 0.00000001 ||
+         (MathAbs(loss - worstLoss) <= 0.00000001 && volume > bestVolume) ||
+         (MathAbs(loss - worstLoss) <= 0.00000001 && MathAbs(volume - bestVolume) <= 0.00000001 && (oldestTime == 0 || openTime < oldestTime)))
       {
-         bestScore = score;
+         worstLoss = loss;
+         bestVolume = volume;
+         oldestTime = openTime;
          bestTicket = ticket;
       }
+   }
+
+   if(bestTicket > 0 && worstLoss < MinRecoveryLossUSD)
+   {
+      // Below the configured minimum, do not realize a small loss unless
+      // the basket has reached SurvivalDD. This keeps normal recovery selective.
+      return 0;
    }
 
    return bestTicket;
@@ -676,21 +676,18 @@ bool CloseRecoveryPosition(ulong ticket)
    if(volume <= 0)
       return false;
 
-   double price = 0;
    double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
    double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
-
    if(bid <= 0 || ask <= 0)
    {
       PrintFormat("[REE] Cannot close #%I64u: invalid Bid/Ask", ticket);
       return false;
    }
 
-   price = (closeType == ORDER_TYPE_BUY) ? ask : bid;
+   double price = (closeType == ORDER_TYPE_BUY) ? ask : bid;
 
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
-
    req.action = TRADE_ACTION_DEAL;
    req.position = ticket;
    req.symbol = SymbolTrade;
@@ -708,35 +705,32 @@ bool CloseRecoveryPosition(ulong ticket)
    {
       LastRecoveryAction = TimeCurrent();
       FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
-      PrintFormat("[REE] Recovery Close Success #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
-                  ticket, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
+      PrintFormat("[REE] Exposure Reduced #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u", ticket, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
       return true;
    }
 
-   PrintFormat("[REE] Recovery Close Failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Sent=%s | RetCode=%u | Comment=%s | Error=%d",
-               ticket, SymbolTrade, volume, req.type_filling, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
+   PrintFormat("[REE] Exposure Reduction Failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Sent=%s | RetCode=%u | Comment=%s | Error=%d", ticket, SymbolTrade, volume, req.type_filling, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
    return false;
 }
 
 //================================================================================================//
 void RecoveryExitEngine(double currentDrawdown)
 {
-   if(!UseRecoveryExit)
+   if(!UseRecoveryExit || CurrentRecoveryState == RECOVERY_OFF)
       return;
 
    if(currentDrawdown < RecoveryStartDD)
-   {
-      LowestPriceAfterBuy = 0;
-      HighestPriceAfterSell = 0;
       return;
-   }
 
    if((TimeCurrent() - LastRecoveryAction) < RecoveryCooldownSec)
       return;
 
    double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
    double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0)
+      return;
 
+   //================ BUY RECOVERY =================
    if(BuyOrders >= 2 && BuyProfits < 0)
    {
       if(LowestPriceAfterBuy == 0)
@@ -748,13 +742,17 @@ void RecoveryExitEngine(double currentDrawdown)
 
       if(retrace >= RetraceTriggerPoints)
       {
-         PrintFormat("[REE] BUY Retracement Detected : %.0f points", retrace);
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_BUY);
 
-         if(ticket > 0 && BuyOrders > 2)
+         // Keep one final layer as the recovery anchor; reduce from N -> N-1.
+         if(ticket > 0 && BuyOrders > 1)
          {
             if(CloseRecoveryPosition(ticket))
+            {
                LowestPriceAfterBuy = bid;
+               CurrentRecoveryState = RECOVERY_COOLDOWN;
+               PrintFormat("[REE] BUY exposure reduced | Remaining BUY layers expected <= %d", BuyOrders - 1);
+            }
          }
       }
    }
@@ -763,6 +761,7 @@ void RecoveryExitEngine(double currentDrawdown)
       LowestPriceAfterBuy = 0;
    }
 
+   //================ SELL RECOVERY =================
    if(SellOrders >= 2 && SellProfits < 0)
    {
       if(HighestPriceAfterSell == 0)
@@ -774,13 +773,17 @@ void RecoveryExitEngine(double currentDrawdown)
 
       if(retrace >= RetraceTriggerPoints)
       {
-         PrintFormat("[REE] SELL Retracement Detected : %.0f points", retrace);
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_SELL);
 
-         if(ticket > 0 && SellOrders > 2)
+         // Keep one final layer as the recovery anchor; reduce from N -> N-1.
+         if(ticket > 0 && SellOrders > 1)
          {
             if(CloseRecoveryPosition(ticket))
+            {
                HighestPriceAfterSell = ask;
+               CurrentRecoveryState = RECOVERY_COOLDOWN;
+               PrintFormat("[REE] SELL exposure reduced | Remaining SELL layers expected <= %d", SellOrders - 1);
+            }
          }
       }
    }
@@ -794,11 +797,16 @@ void RecoveryExitEngine(double currentDrawdown)
 void DisplayDashboard(double dd, double rsi, bool recovery)
 {
    string mode = recovery ? "RECOVERY MODE (Aggressive)" : "NORMAL GROWTH";
+   string recoveryState = "OFF";
+   if(CurrentRecoveryState == RECOVERY_MONITOR) recoveryState = "MONITOR";
+   if(CurrentRecoveryState == RECOVERY_ACTIVE) recoveryState = "ACTIVE";
+   if(CurrentRecoveryState == RECOVERY_COOLDOWN) recoveryState = "COOLDOWN";
 
    Comment(
       "======== GRID RECOVERY GRID A New Grid V1 ========\n",
       "Status   : ", (IsTerminated ? "TERMINATED" : "RUNNING"), "\n",
       "Mode     : ", mode, "\n",
+      "Recovery : ", recoveryState, "\n",
       "Drawdown : ", DoubleToString(dd, 2), "%\n",
       "Adaptive Base : ", DoubleToString(AdaptiveEquityBase, 2), "\n",
       "Locked Profit : ", DoubleToString(LockedProfit, 2), "\n",
