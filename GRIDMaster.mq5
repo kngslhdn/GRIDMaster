@@ -8,10 +8,11 @@
 // SYMBOL / FILLING / VOLUME SAFETY FIX
 // RECOVERY REDUCE EXPOSURE FIX
 // RECOVERY EXIT ENGINE AUDIT FIX
+// RECOVERY STATE MACHINE FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.008"
+#property version   "6.009"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -252,39 +253,90 @@ void UpdateRecoveryState(double currentDrawdown)
       return;
    }
 
-   // Recovery stays active while DD is at or above the recovery threshold.
-   // This permanently blocks new grid exposure until the basket recovers.
-   if(currentDrawdown >= RecoveryStartDD)
-   {
-      if(CurrentRecoveryState == RECOVERY_OFF || CurrentRecoveryState == RECOVERY_COOLDOWN)
-      {
-         CurrentRecoveryState = RECOVERY_MONITOR;
-         PrintFormat("[RECOVERY] ACTIVATED | DD=%.2f%% | Grid entries frozen", currentDrawdown);
-      }
-
-      if(CurrentRecoveryState == RECOVERY_MONITOR &&
-         (BuyOrders >= 2 || SellOrders >= 2))
-      {
-         CurrentRecoveryState = RECOVERY_ACTIVE;
-      }
-
-      return;
-   }
-
-   // After a successful reduction, keep the grid frozen for the configured cooldown.
+   //========================================================
+   // COOLDOWN HAS PRIORITY
+   // Never reset COOLDOWN to MONITOR while DD is still high.
+   //========================================================
    if(CurrentRecoveryState == RECOVERY_COOLDOWN)
    {
       if(TimeCurrent() < FreezeGridUntil)
          return;
 
+      if(currentDrawdown >= RecoveryStartDD)
+      {
+         CurrentRecoveryState = RECOVERY_ACTIVE;
+
+         PrintFormat(
+            "[RECOVERY] Cooldown complete -> ACTIVE | DD=%.2f%% | Grid remains frozen",
+            currentDrawdown
+         );
+
+         return;
+      }
+
       CurrentRecoveryState = RECOVERY_OFF;
-      Print("[RECOVERY] Cooldown complete. Recovery cleared; normal grid may resume.");
+      LowestPriceAfterBuy = 0;
+      HighestPriceAfterSell = 0;
+
+      PrintFormat(
+         "[RECOVERY] Cooldown complete -> OFF | DD=%.2f%% | Normal grid may resume",
+         currentDrawdown
+      );
+
       return;
    }
 
-   CurrentRecoveryState = RECOVERY_OFF;
-   LowestPriceAfterBuy = 0;
-   HighestPriceAfterSell = 0;
+   //========================================================
+   // DD BELOW RECOVERY THRESHOLD
+   //========================================================
+   if(currentDrawdown < RecoveryStartDD)
+   {
+      CurrentRecoveryState = RECOVERY_OFF;
+      LowestPriceAfterBuy = 0;
+      HighestPriceAfterSell = 0;
+      return;
+   }
+
+   //========================================================
+   // DD >= RECOVERY START
+   //========================================================
+   if(CurrentRecoveryState == RECOVERY_OFF)
+   {
+      CurrentRecoveryState = RECOVERY_MONITOR;
+
+      PrintFormat(
+         "[RECOVERY] ACTIVATED -> MONITOR | DD=%.2f%% | Grid entries frozen",
+         currentDrawdown
+      );
+   }
+
+   //========================================================
+   // MONITOR -> ACTIVE
+   //========================================================
+   if(CurrentRecoveryState == RECOVERY_MONITOR)
+   {
+      if(BuyOrders >= 2 || SellOrders >= 2)
+      {
+         CurrentRecoveryState = RECOVERY_ACTIVE;
+
+         PrintFormat(
+            "[RECOVERY] MONITOR -> ACTIVE | DD=%.2f%% | BUY=%d SELL=%d",
+            currentDrawdown,
+            BuyOrders,
+            SellOrders
+         );
+      }
+
+      return;
+   }
+
+   //========================================================
+   // ACTIVE
+   // Keep recovery active while DD remains >= threshold.
+   // RecoveryExitEngine() handles the actual reduction.
+   //========================================================
+   if(CurrentRecoveryState == RECOVERY_ACTIVE)
+      return;
 }
 
 //================================================================================================//
@@ -747,27 +799,23 @@ void RecoveryExitEngine(double currentDrawdown)
          // loss is below MinRecoveryLossUSD. The basket DD has priority.
          if(ticket == 0 && survivalMode)
          {
-            ticket = FindBestRecoveryPosition(POSITION_TYPE_BUY);
-            if(ticket == 0)
+            // Find the worst losing BUY without the minimum-loss gate.
+            double worstLoss = 0.0;
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
             {
-               // Find the worst losing BUY without the minimum-loss gate.
-               double worstLoss = 0.0;
-               for(int i = PositionsTotal() - 1; i >= 0; i--)
-               {
-                  ulong t = PositionGetTicket(i);
-                  if(!PositionSelectByTicket(t)) continue;
-                  if(PositionGetInteger(POSITION_MAGIC) != OrdersID) continue;
-                  if(PositionGetString(POSITION_SYMBOL) != SymbolTrade) continue;
-                  if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+               ulong t = PositionGetTicket(i);
+               if(!PositionSelectByTicket(t)) continue;
+               if(PositionGetInteger(POSITION_MAGIC) != OrdersID) continue;
+               if(PositionGetString(POSITION_SYMBOL) != SymbolTrade) continue;
+               if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
 
-                  double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-                  if(p >= 0) continue;
-                  double loss = -p;
-                  if(loss > worstLoss)
-                  {
-                     worstLoss = loss;
-                     ticket = t;
-                  }
+               double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+               if(p >= 0) continue;
+               double loss = -p;
+               if(loss > worstLoss)
+               {
+                  worstLoss = loss;
+                  ticket = t;
                }
             }
          }
