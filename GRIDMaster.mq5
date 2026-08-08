@@ -3,10 +3,11 @@
 // Adaptive Equity Scaling Edition
 // 24/7 EXIT & PROTECTION FIX
 // TRAILING STATE FIX
+// LAST GRID PRICE FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.003"
+#property version   "6.004"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -263,13 +264,8 @@ void ManageExit(bool recovery)
          if(BuyProfits >= TrailingStartUSD && BuyProfits > MaxBuyProfitSeen)
             MaxBuyProfitSeen = BuyProfits;
 
-         // Do not gate this check by current BuyProfits >= TrailingStartUSD.
-         // Example: peak=10, trailing stop=2 -> close at <=8, even if current profit is below 5.
-         if(MaxBuyProfitSeen >= TrailingStartUSD &&
-            BuyProfits <= MaxBuyProfitSeen - TrailingStopUSD)
-         {
+         if(MaxBuyProfitSeen >= TrailingStartUSD && BuyProfits <= MaxBuyProfitSeen - TrailingStopUSD)
             CloseOrdersByType(POSITION_TYPE_BUY);
-         }
       }
    }
 
@@ -286,11 +282,8 @@ void ManageExit(bool recovery)
          if(SellProfits >= TrailingStartUSD && SellProfits > MaxSellProfitSeen)
             MaxSellProfitSeen = SellProfits;
 
-         if(MaxSellProfitSeen >= TrailingStartUSD &&
-            SellProfits <= MaxSellProfitSeen - TrailingStopUSD)
-         {
+         if(MaxSellProfitSeen >= TrailingStartUSD && SellProfits <= MaxSellProfitSeen - TrailingStopUSD)
             CloseOrdersByType(POSITION_TYPE_SELL);
-         }
       }
    }
 }
@@ -304,6 +297,9 @@ void UpdateStatus()
    SellProfits = 0;
    PriceOpenLastBuy = 0;
    PriceOpenLastSell = 0;
+
+   datetime latestBuyTime = 0;
+   datetime latestSellTime = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -320,22 +316,36 @@ void UpdateStatus()
 
       ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
 
       if(type == POSITION_TYPE_BUY)
       {
          BuyOrders++;
          BuyProfits += p;
-         PriceOpenLastBuy = PositionGetDouble(POSITION_PRICE_OPEN);
+
+         // CRITICAL: use the most recently opened BUY layer.
+         if(openTime >= latestBuyTime)
+         {
+            latestBuyTime = openTime;
+            PriceOpenLastBuy = openPrice;
+         }
       }
       else if(type == POSITION_TYPE_SELL)
       {
          SellOrders++;
          SellProfits += p;
-         PriceOpenLastSell = PositionGetDouble(POSITION_PRICE_OPEN);
+
+         // CRITICAL: use the most recently opened SELL layer.
+         if(openTime >= latestSellTime)
+         {
+            latestSellTime = openTime;
+            PriceOpenLastSell = openPrice;
+         }
       }
    }
 
-   // Reset state ONLY after the basket has actually disappeared.
+   // Reset trailing state ONLY after the basket has actually disappeared.
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
 
