@@ -1,0 +1,1 @@
+Temporary verification marker for Trailing State Fix v6.003. Read/write connector test.
