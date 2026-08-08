@@ -13,10 +13,11 @@
 // RECOVERY EXPOSURE REDUCTION FIX
 // HARD PROTECTION LATCH FIX
 // RECOVERY DIAGNOSTIC LOG FIX
+// HIGH-DD RETRACEMENT BYPASS FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.013"
+#property version   "6.014"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -564,17 +565,36 @@ void RecoveryExitEngine(double currentDrawdown)
 
    double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID), ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
    if(bid <= 0 || ask <= 0) return;
+
+   // HIGH-DD RULE:
+   // Normal recovery (DD < SurvivalDD) still waits for the configured retracement.
+   // Survival recovery (DD >= SurvivalDD) MUST reduce exposure immediately.
+   // This removes the dangerous dependency on a 500-point retracement while the account is already under severe DD.
    bool survivalMode = (currentDrawdown >= SurvivalDD);
 
    PrintFormat("[RECOVERY] EVALUATE | DD=%.2f%% | State=%s | BUY=%d SELL=%d | Exposure BUY=%.8f SELL=%.8f | BasketLoss BUY=%.2f SELL=%.2f | Survival=%s", currentDrawdown, CurrentRecoveryState == RECOVERY_ACTIVE ? "ACTIVE" : "MONITOR", BuyOrders, SellOrders, GetRecoveryExposure(POSITION_TYPE_BUY), GetRecoveryExposure(POSITION_TYPE_SELL), GetRecoveryBasketLoss(POSITION_TYPE_BUY), GetRecoveryBasketLoss(POSITION_TYPE_SELL), survivalMode ? "ON" : "OFF");
 
    if(BuyOrders >= 2 && BuyProfits < 0)
    {
-      if(LowestPriceAfterBuy == 0) LowestPriceAfterBuy = bid;
-      if(bid < LowestPriceAfterBuy) LowestPriceAfterBuy = bid;
-      double retrace = (bid - LowestPriceAfterBuy) / _Point;
-      PrintFormat("[RECOVERY] BUY CHECK | Retrace=%.1f/%g | Lowest=%.5f | BasketLoss=%.2f | WorstProfit=%.2f", retrace, RetraceTriggerPoints, LowestPriceAfterBuy, GetRecoveryBasketLoss(POSITION_TYPE_BUY), BuyProfits);
-      if(retrace >= RetraceTriggerPoints)
+      double retrace = 0.0;
+      bool reductionTrigger = false;
+
+      if(survivalMode)
+      {
+         // At SurvivalDD, do not wait for price to retrace. Reduce the largest losing exposure now.
+         reductionTrigger = true;
+         PrintFormat("[RECOVERY] BUY SURVIVAL REDUCE | DD=%.2f%% >= SurvivalDD=%.2f%% | Retracement BYPASSED | BasketLoss=%.2f | WorstProfit=%.2f", currentDrawdown, SurvivalDD, GetRecoveryBasketLoss(POSITION_TYPE_BUY), BuyProfits);
+      }
+      else
+      {
+         if(LowestPriceAfterBuy == 0) LowestPriceAfterBuy = bid;
+         if(bid < LowestPriceAfterBuy) LowestPriceAfterBuy = bid;
+         retrace = (bid - LowestPriceAfterBuy) / _Point;
+         reductionTrigger = (retrace >= RetraceTriggerPoints);
+         PrintFormat("[RECOVERY] BUY CHECK | Retrace=%.1f/%g | Lowest=%.5f | BasketLoss=%.2f | WorstProfit=%.2f", retrace, RetraceTriggerPoints, LowestPriceAfterBuy, GetRecoveryBasketLoss(POSITION_TYPE_BUY), BuyProfits);
+      }
+
+      if(reductionTrigger)
       {
          double basketLoss = GetRecoveryBasketLoss(POSITION_TYPE_BUY);
          bool allowBelowMinLoss = survivalMode || (basketLoss >= MinRecoveryLossUSD);
@@ -586,22 +606,36 @@ void RecoveryExitEngine(double currentDrawdown)
             {
                LowestPriceAfterBuy = bid;
                CurrentRecoveryState = RECOVERY_COOLDOWN;
-               PrintFormat("[RECOVERY] BUY REDUCED | DD=%.2f%% | Retrace=%.1f/%g | BasketLoss=%.2f | Exposure %.8f -> %.8f | Survival=%s | MinLossGate=%s", currentDrawdown, retrace, RetraceTriggerPoints, basketLoss, exposureBefore, GetRecoveryExposure(POSITION_TYPE_BUY), survivalMode ? "ON" : "OFF", allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
+               PrintFormat("[RECOVERY] BUY REDUCED | DD=%.2f%% | Retrace=%s | BasketLoss=%.2f | Exposure %.8f -> %.8f | Survival=%s | MinLossGate=%s", currentDrawdown, survivalMode ? "BYPASSED" : DoubleToString(retrace, 1), basketLoss, exposureBefore, GetRecoveryExposure(POSITION_TYPE_BUY), survivalMode ? "ON" : "OFF", allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
                return;
             }
          }
-         else PrintFormat("[RECOVERY] BUY NO REDUCTION | EligibleTicket=%I64u | BasketLoss=%.2f | MinGate=%s", ticket, basketLoss, allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
+         else PrintFormat("[RECOVERY] BUY NO REDUCTION | EligibleTicket=%I64u | BasketLoss=%.2f | MinGate=%s | Survival=%s", ticket, basketLoss, allowBelowMinLoss ? "BYPASSED" : "ACTIVE", survivalMode ? "ON" : "OFF");
       }
    }
    else LowestPriceAfterBuy = 0;
 
    if(SellOrders >= 2 && SellProfits < 0)
    {
-      if(HighestPriceAfterSell == 0) HighestPriceAfterSell = ask;
-      if(ask > HighestPriceAfterSell) HighestPriceAfterSell = ask;
-      double retrace = (HighestPriceAfterSell - ask) / _Point;
-      PrintFormat("[RECOVERY] SELL CHECK | Retrace=%.1f/%g | Highest=%.5f | BasketLoss=%.2f | WorstProfit=%.2f", retrace, RetraceTriggerPoints, HighestPriceAfterSell, GetRecoveryBasketLoss(POSITION_TYPE_SELL), SellProfits);
-      if(retrace >= RetraceTriggerPoints)
+      double retrace = 0.0;
+      bool reductionTrigger = false;
+
+      if(survivalMode)
+      {
+         // At SurvivalDD, do not wait for price to retrace. Reduce the largest losing exposure now.
+         reductionTrigger = true;
+         PrintFormat("[RECOVERY] SELL SURVIVAL REDUCE | DD=%.2f%% >= SurvivalDD=%.2f%% | Retracement BYPASSED | BasketLoss=%.2f | WorstProfit=%.2f", currentDrawdown, SurvivalDD, GetRecoveryBasketLoss(POSITION_TYPE_SELL), SellProfits);
+      }
+      else
+      {
+         if(HighestPriceAfterSell == 0) HighestPriceAfterSell = ask;
+         if(ask > HighestPriceAfterSell) HighestPriceAfterSell = ask;
+         retrace = (HighestPriceAfterSell - ask) / _Point;
+         reductionTrigger = (retrace >= RetraceTriggerPoints);
+         PrintFormat("[RECOVERY] SELL CHECK | Retrace=%.1f/%g | Highest=%.5f | BasketLoss=%.2f | WorstProfit=%.2f", retrace, RetraceTriggerPoints, HighestPriceAfterSell, GetRecoveryBasketLoss(POSITION_TYPE_SELL), SellProfits);
+      }
+
+      if(reductionTrigger)
       {
          double basketLoss = GetRecoveryBasketLoss(POSITION_TYPE_SELL);
          bool allowBelowMinLoss = survivalMode || (basketLoss >= MinRecoveryLossUSD);
@@ -613,11 +647,11 @@ void RecoveryExitEngine(double currentDrawdown)
             {
                HighestPriceAfterSell = ask;
                CurrentRecoveryState = RECOVERY_COOLDOWN;
-               PrintFormat("[RECOVERY] SELL REDUCED | DD=%.2f%% | Retrace=%.1f/%g | BasketLoss=%.2f | Exposure %.8f -> %.8f | Survival=%s | MinLossGate=%s", currentDrawdown, retrace, RetraceTriggerPoints, basketLoss, exposureBefore, GetRecoveryExposure(POSITION_TYPE_SELL), survivalMode ? "ON" : "OFF", allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
+               PrintFormat("[RECOVERY] SELL REDUCED | DD=%.2f%% | Retrace=%s | BasketLoss=%.2f | Exposure %.8f -> %.8f | Survival=%s | MinLossGate=%s", currentDrawdown, survivalMode ? "BYPASSED" : DoubleToString(retrace, 1), basketLoss, exposureBefore, GetRecoveryExposure(POSITION_TYPE_SELL), survivalMode ? "ON" : "OFF", allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
                return;
             }
          }
-         else PrintFormat("[RECOVERY] SELL NO REDUCTION | EligibleTicket=%I64u | BasketLoss=%.2f | MinGate=%s", ticket, basketLoss, allowBelowMinLoss ? "BYPASSED" : "ACTIVE");
+         else PrintFormat("[RECOVERY] SELL NO REDUCTION | EligibleTicket=%I64u | BasketLoss=%.2f | MinGate=%s | Survival=%s", ticket, basketLoss, allowBelowMinLoss ? "BYPASSED" : "ACTIVE", survivalMode ? "ON" : "OFF");
       }
    }
    else HighestPriceAfterSell = 0;
