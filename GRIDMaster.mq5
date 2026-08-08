@@ -1,10 +1,10 @@
 //================================================================================================//
 // GRIDMaster - PROFIT PROTECTION / ANOMALY SAFE EDITION 2026
-// v7.000 - PROFIT-PROTECTED GRID + DD GOVERNOR + ANOMALY BRAKE
+// v7.001 - PROFIT-PROTECTED GRID + DD GOVERNOR + ANOMALY BRAKE FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "7.000"
+#property version   "7.001"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum ProtectionState {STATE_NORMAL=0,STATE_MONITOR,STATE_REDUCE,STATE_SURVIVAL,STATE_EMERGENCY,STATE_LOCKED};
@@ -60,7 +60,7 @@ input int RecoveryFreezeSec=20;
 input double MinRecoveryLossUSD=15.0;
 input double SurvivalBasketLossUSD=45.0;
 input int MaxReductionActions=3;
-input double AnomalySpreadPoints=250.0;
+input double AnomalySpreadPoints=500.0;
 input double AnomalyJumpPoints=1000.0;
 input int AnomalyCooldownSec=60;
 
@@ -103,18 +103,44 @@ double ProtectionDD()
 }
 
 //================================================================================================//
-// MARKET HEALTH
+// MARKET HEALTH - ANOMALY BRAKE FIX
+// Cooldown is started only when a NEW anomaly is detected. While the brake is active,
+// repeated ticks cannot extend the cooldown or spam the Journal. Exit/protection engines
+// continue to run independently; the brake only blocks new entries.
 //================================================================================================//
 bool MarketHealthy()
 {
    double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK);
    if(bid<=0||ask<=0||ask<bid||_Point<=0)return false;
+
+   datetime now=TimeCurrent();
    double spread=(ask-bid)/_Point,mid=(bid+ask)*0.5;
-   if(AnomalySpreadPoints>0 && spread>=AnomalySpreadPoints){AnomalyBrakeActive=true;AnomalyUntil=TimeCurrent()+AnomalyCooldownSec;return false;}
-   if(LastMidPrice>0 && AnomalyJumpPoints>0 && MathAbs(mid-LastMidPrice)/_Point>=AnomalyJumpPoints){AnomalyBrakeActive=true;AnomalyUntil=TimeCurrent()+AnomalyCooldownSec;LastMidPrice=mid;return false;}
+
+   // Existing brake: do NOT reset/extend the cooldown on every tick.
+   if(AnomalyBrakeActive)
+   {
+      LastMidPrice=mid;
+      if(now<AnomalyUntil)return false;
+      AnomalyBrakeActive=false;
+      AnomalyUntil=0;
+   }
+
+   bool anomaly=false;
+   if(AnomalySpreadPoints>0 && spread>=AnomalySpreadPoints)
+      anomaly=true;
+   else if(LastMidPrice>0 && AnomalyJumpPoints>0 && MathAbs(mid-LastMidPrice)/_Point>=AnomalyJumpPoints)
+      anomaly=true;
+
    LastMidPrice=mid;
-   if(AnomalyBrakeActive && TimeCurrent()>=AnomalyUntil)AnomalyBrakeActive=false;
-   return !AnomalyBrakeActive;
+
+   if(anomaly)
+   {
+      AnomalyBrakeActive=true;
+      AnomalyUntil=now+AnomalyCooldownSec;
+      return false;
+   }
+
+   return true;
 }
 
 bool IsTradingHour()
@@ -138,7 +164,7 @@ int OnInit()
    HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;
    HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;
    if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}
-   PrintFormat("[INIT] GRIDMaster v7.000 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
+   PrintFormat("[INIT] GRIDMaster v7.001 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason){if(HandleRSI!=INVALID_HANDLE)IndicatorRelease(HandleRSI);if(HandleMA!=INVALID_HANDLE)IndicatorRelease(HandleMA);Comment("");}
@@ -256,7 +282,7 @@ void ExecuteOpen(ENUM_ORDER_TYPE type)
 
 //================================================================================================//
 // PROFIT ENGINE - CRITICAL FIX
-// The old trailing logic could arm at +$5 and later close the entire grid at -$50/-$100.
+// The old trailing logic could arm at +$5 and later close the entire grid at -$50... 
 // v7 NEVER trails a basket below zero. A positive peak is only allowed to close a still-profitable basket.
 //================================================================================================//
 void ManageProfitExit()
@@ -364,6 +390,6 @@ string StateText(){if(CurrentState==STATE_MONITOR)return "MONITOR";if(CurrentSta
 void Dashboard(double dd)
 {
    double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;
-   Comment("======== GRIDMaster v7.000 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");
+   Comment("======== GRIDMaster v7.001 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");
 }
 //================================================================================================//
