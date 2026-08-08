@@ -1,10 +1,10 @@
 //================================================================================================//
 // GRIDMaster - PROFIT PROTECTION / BASKET RECOVERY EDITION 2026
-// v7.008 - RECOVERY V4 + GROSS LOSS + STALE POSITION + SWAP PROTECTION
+// v7.010 - RECOVERY V5 + LOSS GATE + PARTIAL REDUCTION + LOSS BUDGET
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "7.008"
+#property version   "7.010"
 
 enum Type {Open_Buy_And_Sell,Open__Only_Buy,Open__Only_Sell};
 enum ProtectionState {STATE_NORMAL=0,STATE_MONITOR,STATE_REDUCE,STATE_SURVIVAL,STATE_EMERGENCY,STATE_LOCKED};
@@ -46,12 +46,12 @@ input int MaxOrders=6;
 input bool UseProgressiveLots=true;
 input double MaxLotMultiplier=4.0;
 input int MagicNumber=88888;
-input string CommentsOrders="GRID MASTER v7.008";
+input string CommentsOrders="GRID MASTER v7.010";
 
 //================================================================================================//
-// RECOVERY V4 / ANOMALY
+// RECOVERY V5 / ANOMALY
 //================================================================================================//
-input string Recovery_Settings="||========== RECOVERY V4 / ANOMALY ==========||";
+input string Recovery_Settings="||========== RECOVERY V5 / ANOMALY ==========||";
 input bool UseRecoveryExit=true;
 input double RecoveryStartDD=7.0;
 input double AggressiveRecoveryDD=8.5;
@@ -61,8 +61,11 @@ input int RecoveryFreezeSec=60;
 input double MinRecoveryLossUSD=20.0;
 input double RecoveryLossTriggerUSD=20.0;
 input double RecoveryDistributedLossTriggerUSD=30.0;
-input double RecoveryConcentrationRatio=0.45;
-input double GrossLossRecoveryTriggerUSD=20.0;
+input double RecoveryConcentrationRatio=0.50;
+input double GrossLossRecoveryTriggerUSD=25.0;
+input double RecoveryNetLossTriggerUSD=10.0;
+input double RecoveryPartialClosePercent=50.0;
+input double RecoveryMaxRealizedLossUSD=5.0;
 input double StalePositionHours=72.0;
 input double MaxPositionSwapLossUSD=20.0;
 input double SurvivalBasketLossUSD=45.0;
@@ -126,7 +129,7 @@ int OnInit(){
    InitialBalance=AccountInfoDouble(ACCOUNT_BALANCE);PeakEquity=MathMax(InitialBalance,AccountInfoDouble(ACCOUNT_EQUITY));HighWaterMark=InitialBalance;
    ReductionActions=0;LastMidPrice=0.0;BuyDirectionLocked=false;SellDirectionLocked=false;HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;
    if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}
-   PrintFormat("[INIT] GRIDMaster v7.008 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
+   PrintFormat("[INIT] GRIDMaster v7.010 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason){if(HandleRSI!=INVALID_HANDLE)IndicatorRelease(HandleRSI);if(HandleMA!=INVALID_HANDLE)IndicatorRelease(HandleMA);Comment("");}
@@ -229,17 +232,18 @@ void ManageProfitExit(){
 void UpdateProtectionState(double dd){if(BuyOrders+SellOrders==0){CurrentState=STATE_NORMAL;ReductionActions=0;return;}if(dd>=EmergencyLimit()){CurrentState=STATE_EMERGENCY;return;}if(dd>=ReduceLimit()){CurrentState=STATE_REDUCE;return;}if(dd>=SoftLimit()){CurrentState=STATE_MONITOR;return;}CurrentState=STATE_NORMAL;}
 
 //================================================================================================//
-// RECOVERY V4 - GROSS LOSS / STALE POSITION / SWAP PROTECTION
+// RECOVERY V5 - GROSS LOSS / NET LOSS GATE / PARTIAL REDUCTION / LOSS BUDGET
 //================================================================================================//
 void RiskRecoveryV4(double dd){
    if(BuyOrders+SellOrders==0||TimeCurrent()<FreezeGridUntil||(TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec||ReductionActions>=MaxReductionActions)return;
+   double basket=BuyProfits+SellProfits;double netLoss=(basket<0.0)?-basket:0.0;if(netLoss<RecoveryNetLossTriggerUSD)return;
    double gross=0.0,worstLoss=0.0,worstSwap=0.0;datetime oldest=0;ulong worstTicket=0;
    for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;double p=PositionGetDouble(POSITION_PROFIT),sw=PositionGetDouble(POSITION_SWAP),net=p+sw;datetime ot=(datetime)PositionGetInteger(POSITION_TIME);if(net<0){double loss=-net;gross+=loss;if(loss>worstLoss){worstLoss=loss;worstSwap=sw;worstTicket=t;}if(oldest==0||ot<oldest)oldest=ot;}}
    if(worstTicket==0)return;
-   double age=(oldest>0)?(double)(TimeCurrent()-oldest)/3600.0:0.0;bool grossTrigger=(GrossLossRecoveryTriggerUSD>0&&gross>=GrossLossRecoveryTriggerUSD);bool staleTrigger=(StalePositionHours>0&&age>=StalePositionHours);bool swapTrigger=(MaxPositionSwapLossUSD>0&&worstSwap<=-MaxPositionSwapLossUSD);
-   if(!(grossTrigger||staleTrigger||swapTrigger))return;
+   double concentration=(gross>0.0)?worstLoss/gross:0.0;double age=(oldest>0)?(double)(TimeCurrent()-oldest)/3600.0:0.0;bool ddGate=(dd>=RecoveryStartDD);bool grossTrigger=(GrossLossRecoveryTriggerUSD>0&&gross>=GrossLossRecoveryTriggerUSD);bool staleTrigger=(StalePositionHours>0&&age>=StalePositionHours);bool swapTrigger=(MaxPositionSwapLossUSD>0&&worstSwap<=-MaxPositionSwapLossUSD);bool concentrated=(concentration>=RecoveryConcentrationRatio);
+   bool trigger=(ddGate&&(grossTrigger||concentrated))||(staleTrigger&&netLoss>=RecoveryNetLossTriggerUSD)||(swapTrigger&&netLoss>=RecoveryNetLossTriggerUSD);if(!trigger)return;
    string reason=staleTrigger?"RECOVERY-STALE":(swapTrigger?"RECOVERY-SWAP":"RECOVERY-GROSS");
-   if(ReduceLargestLoser(reason))PrintFormat("[RECOVERY V4] %s | gross=%.2f | worst=%.2f | age=%.1fh | swap=%.2f | DD=%.2f%%",reason,gross,worstLoss,age,worstSwap,dd);
+   if(ReduceLargestLoser(reason))PrintFormat("[RECOVERY V5] %s | net=%.2f | gross=%.2f | worst=%.2f | concentration=%.1f%% | age=%.1fh | swap=%.2f | DD=%.2f%%",reason,netLoss,gross,worstLoss,concentration*100.0,age,worstSwap,dd);
 }
 
 //================================================================================================//
@@ -247,6 +251,7 @@ void RiskRecoveryV4(double dd){
 //================================================================================================//
 void RecoveryGovernor(double dd){
    if(BuyOrders+SellOrders==0||TimeCurrent()<FreezeGridUntil||(TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec||ReductionActions>=MaxReductionActions)return;
+   double basket=BuyProfits+SellProfits;double netLoss=(basket<0.0)?-basket:0.0;if(netLoss<RecoveryNetLossTriggerUSD)return;
    double bl=BasketLoss(POSITION_TYPE_BUY),sl=BasketLoss(POSITION_TYPE_SELL);bool active=dd>=RecoveryStartDD,aggressive=dd>=AggressiveRecoveryDD,survival=dd>=SurvivalDD;
    if(survival){CurrentState=STATE_SURVIVAL;if(bl>=SurvivalBasketLossUSD&&bl>=sl&&BuyOrders>0){if(CloseSide(POSITION_TYPE_BUY,"SURVIVAL-BUY")){RecoveryActionThisTick=true;SetFreeze();return;}}if(sl>=SurvivalBasketLossUSD&&sl>bl&&SellOrders>0){if(CloseSide(POSITION_TYPE_SELL,"SURVIVAL-SELL")){RecoveryActionThisTick=true;SetFreeze();return;}}}
    if((active||aggressive)&&(aggressive||bl>=RecoveryLossTriggerUSD||sl>=RecoveryLossTriggerUSD)){if(ReduceLargestLoser("RECOVERY-DD"))return;}
@@ -258,14 +263,15 @@ double BasketLoss(ENUM_POSITION_TYPE type){double p=0;for(int i=PositionsTotal()
 // REDUCE / CLOSE ENGINE
 //================================================================================================//
 ulong LargestLosingTicket(){ulong best=0;double bestLoss=0;double bestVol=0;datetime oldest=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);if(p>=0)continue;double loss=-p,vol=PositionGetDouble(POSITION_VOLUME);datetime ot=(datetime)PositionGetInteger(POSITION_TIME);if(vol>bestVol+1e-8||(MathAbs(vol-bestVol)<=1e-8&&loss>bestLoss+1e-8)||(MathAbs(vol-bestVol)<=1e-8&&MathAbs(loss-bestLoss)<=1e-8&&(oldest==0||ot<oldest))){best=t;bestLoss=loss;bestVol=vol;oldest=ot;}}return best;}
-bool ReduceLargestLoser(string reason){ulong t=LargestLosingTicket();if(t==0||!PositionSelectByTicket(t))return false;ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);double loss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));double vol=PositionGetDouble(POSITION_VOLUME);if(!ClosePosition(t,reason))return false;ReductionActions++;LastRecoveryAction=TimeCurrent();FreezeGridUntil=TimeCurrent()+RecoveryFreezeSec;LockDirection(type,reason);RecoveryActionThisTick=true;PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | lot=%.4f | loss=%.2f | action=%d/%d",reason,t,EnumToString(type),vol,loss,ReductionActions,MaxReductionActions);return true;}
+double RecoveryAllowedCloseVolume(ulong ticket,double loss,double vol){double minVol=SymbolInfoDouble(SymbolTrade,SYMBOL_VOLUME_MIN);if(minVol<=0||vol<=0)return 0.0;double pct=RecoveryPartialClosePercent;if(pct<=0.0)pct=50.0;if(pct>100.0)pct=100.0;double closeVol=NormalizeVolume(vol*pct/100.0);if(closeVol<=0.0)return 0.0;if(closeVol>=vol-1e-8&&RecoveryMaxRealizedLossUSD>0.0&&loss>RecoveryMaxRealizedLossUSD){closeVol=NormalizeVolume(vol-minVol);if(closeVol<=0.0)return 0.0;}if(RecoveryMaxRealizedLossUSD>0.0&&loss>0.0){double budgetRatio=RecoveryMaxRealizedLossUSD/loss;if(budgetRatio<1.0){double budgetVol=NormalizeVolume(vol*budgetRatio);if(budgetVol>0.0)closeVol=MathMin(closeVol,budgetVol);}}closeVol=NormalizeVolume(closeVol);if(closeVol>=vol-1e-8&&vol>minVol)closeVol=NormalizeVolume(vol-minVol);if(closeVol<minVol-1e-8)return 0.0;return closeVol;}
+bool ReduceLargestLoser(string reason){ulong t=LargestLosingTicket();if(t==0||!PositionSelectByTicket(t))return false;ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);double net=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);double loss=-net;double vol=PositionGetDouble(POSITION_VOLUME);double closeVol=RecoveryAllowedCloseVolume(t,loss,vol);if(closeVol<=0.0)return false;double basket=BuyProfits+SellProfits;if(basket>=-RecoveryNetLossTriggerUSD)return false;if(!ClosePosition(t,reason,closeVol))return false;ReductionActions++;LastRecoveryAction=TimeCurrent();FreezeGridUntil=TimeCurrent()+RecoveryFreezeSec;LockDirection(type,reason);RecoveryActionThisTick=true;PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | lot=%.4f/%.4f | loss=%.2f | action=%d/%d",reason,t,EnumToString(type),closeVol,vol,loss,ReductionActions,MaxReductionActions);return true;}
 void SetFreeze(){FreezeGridUntil=TimeCurrent()+RecoveryFreezeSec;}
 
 bool CloseSide(ENUM_POSITION_TYPE type,string reason){bool any=false;for(int pass=0;pass<10;pass++){bool found=false,changed=false;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=type)continue;found=true;if(ClosePosition(t,reason)){changed=true;any=true;}}if(!found||!changed)break;}return any;}
-void CloseAllManaged(string reason){for(int pass=0;pass<12;pass++){bool found=false,changed=false;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;found=true;double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);if(p<0&&ClosePosition(t,reason)){changed=true;continue;}}if(!found)break;if(!changed){for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;if(ClosePosition(t,reason))changed=true;} }if(!changed)break;}}
-bool ClosePosition(ulong ticket,string reason){
+void CloseAllManaged(string reason){for(int pass=0;pass<12;pass++){bool found=false,changed=false;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;found=true;double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);if(p<0&&ClosePosition(t,reason)){changed=true;continue;}}if(!found)break;if(!changed){for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t==0||!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;if(ClosePosition(t,reason))changed=true;}}if(!changed)break;}}
+bool ClosePosition(ulong ticket,string reason,double requestedVolume=0.0){
    if(ticket==0||!PositionSelectByTicket(ticket))return false;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)return false;
-   ENUM_POSITION_TYPE pt=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);ENUM_ORDER_TYPE type=(pt==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;double vol=PositionGetDouble(POSITION_VOLUME);if(vol<=0)return false;
+   ENUM_POSITION_TYPE pt=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);ENUM_ORDER_TYPE type=(pt==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;double posVol=PositionGetDouble(POSITION_VOLUME);double vol=(requestedVolume>0.0)?NormalizeVolume(requestedVolume):posVol;if(vol<=0||vol>posVol+1e-8)return false;
    double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK);if(bid<=0||ask<=0)return false;
    MqlTradeRequest req={};MqlTradeResult res={};req.action=TRADE_ACTION_DEAL;req.position=ticket;req.symbol=SymbolTrade;req.magic=OrdersID;req.volume=vol;req.type=type;req.price=(type==ORDER_TYPE_BUY)?ask:bid;req.deviation=30;req.type_filling=SafeFilling();req.comment=reason;
    ResetLastError();bool sent=OrderSend(req,res);if(!sent||!TradeOK(res.retcode)){PrintFormat("[CLOSE] FAILED | ticket=%I64u | %s | rc=%u | %s | err=%d",ticket,reason,res.retcode,res.comment,GetLastError());return false;}PrintFormat("[CLOSE] SUCCESS | ticket=%I64u | %s | volume=%.4f | rc=%u",ticket,reason,res.volume,res.retcode);return true;
@@ -275,4 +281,4 @@ bool ClosePosition(ulong ticket,string reason){
 // DASHBOARD
 //================================================================================================//
 string StateText(){if(CurrentState==STATE_MONITOR)return "MONITOR";if(CurrentState==STATE_REDUCE)return "REDUCE";if(CurrentState==STATE_SURVIVAL)return "SURVIVAL";if(CurrentState==STATE_EMERGENCY)return "EMERGENCY";if(CurrentState==STATE_LOCKED)return "LOCKED";return "NORMAL";}
-void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.008 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | GrossLoss: ",DoubleToString(GrossLosingExposure(),2),"\n","Spread: ",DoubleToString(spread,1)," pts | Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK"),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
+void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.010 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | GrossLoss: ",DoubleToString(GrossLosingExposure(),2),"\n","Spread: ",DoubleToString(spread,1)," pts | Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK"),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
