@@ -1,0 +1,49 @@
+name: Apply GRIDMaster v7.005 protection patch
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Patch GRIDMaster
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('GRIDMaster.mq5')
+          s = p.read_text(encoding='utf-8')
+          if 'v7.005 - CATASTROPHIC BASKET EXIT' in s:
+              raise SystemExit('already patched')
+
+          s = s.replace('// v7.004 - BASKET EXIT + RECOVERY GOVERNOR FIX', '// v7.005 - CATASTROPHIC BASKET EXIT + RECOVERY GOVERNOR FIX')
+          s = s.replace('#property version   "7.004"', '#property version   "7.005"')
+
+          anchor = 'input double MaxBasketLossUSD=60.0;\n'
+          s = s.replace(anchor, anchor + 'input double CatastrophicBasketLossUSD=120.0; // flatten a max-grid basket before emergency DD\n')
+
+          old = '''   //============================================================================================//\n   // EMERGENCY - FLATTEN BEFORE HARD LIMIT\n   //============================================================================================//\n   if(dd>=EmergencyLimit())\n   {'''
+          new = '''   //============================================================================================//\n   // CATASTROPHIC MAX-GRID EXIT\n   // If a side has reached MaxOrders and the whole basket is already deeply underwater,\n   // do not let Recovery/SURVIVAL realize the loss one ticket at a time while price trends away.\n   // Flatten the basket immediately. This is an EXIT-ONLY protection; it never creates exposure.\n   //============================================================================================//\n   double liveBasketProfit=BuyProfits+SellProfits;\n   double liveBasketLoss=(liveBasketProfit<0.0)?-liveBasketProfit:0.0;\n   bool maxGridReached=(BuyOrders>=MaxOrders || SellOrders>=MaxOrders);\n   if(maxGridReached && CatastrophicBasketLossUSD>0.0 && liveBasketLoss>=CatastrophicBasketLossUSD)\n   {\n      CurrentState=STATE_EMERGENCY;\n      CloseAllManaged("CATASTROPHIC-BASKET");\n      UpdateStatus();\n      if(BuyOrders==0 && SellOrders==0)\n      {\n         IsTerminated=true;\n         PrintFormat("[PROTECTION] CATASTROPHIC BASKET EXIT | DD=%.2f%% | Loss=%.2f | EA LOCKED",dd,liveBasketLoss);\n      }\n      Dashboard(dd);\n      return;\n   }\n\n   //============================================================================================//\n   // EMERGENCY - FLATTEN BEFORE HARD LIMIT\n   //============================================================================================//\n   if(dd>=EmergencyLimit())\n   {'''
+          if old not in s:
+              raise SystemExit('emergency anchor not found')
+          s = s.replace(old, new, 1)
+
+          s = s.replace('GRIDMaster v7.004', 'GRIDMaster v7.005')
+          s = s.replace('GRIDMaster v7.004', 'GRIDMaster v7.005')
+          p.write_text(s, encoding='utf-8')
+
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GRIDMaster.mq5
+          git commit -m 'fix: add catastrophic max-grid basket exit v7.005'
+          git push
