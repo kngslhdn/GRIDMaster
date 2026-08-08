@@ -1,10 +1,10 @@
 //================================================================================================//
 // GRIDMaster - PROFIT PROTECTION / BASKET RECOVERY EDITION 2026
-// v7.005 - BASKET EXIT + RECOVERY GOVERNOR + CATASTROPHIC PROTECTION
+// v7.006 - RECOVERY V2 + SAFE BASKET CLOSE ENGINE + CATASTROPHIC PROTECTION
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "7.005"
+#property version   "7.006"
 
 //================================================================================================//
 // CORE TYPES
@@ -59,9 +59,10 @@ input bool UseRecoveryExit=true;
 input double RecoveryStartDD=7.0;
 input double AggressiveRecoveryDD=8.5;
 input double SurvivalDD=10.0;
-input int RecoveryCooldownSec=10;
-input int RecoveryFreezeSec=20;
-input double MinRecoveryLossUSD=15.0;
+input int RecoveryCooldownSec=30;
+input int RecoveryFreezeSec=60;
+input double MinRecoveryLossUSD=20.0;
+input double RecoveryConcentrationRatio=0.45;
 input double SurvivalBasketLossUSD=45.0;
 input int MaxReductionActions=3;
 input double AnomalySpreadPoints=500.0;
@@ -112,7 +113,7 @@ bool IsTradingHour(){if(!UseTradingHour)return true;MqlDateTime dt;TimeToStruct(
 //================================================================================================//
 // INITIALIZATION
 //================================================================================================//
-int OnInit(){SymbolTrade=_Symbol;OrdersID=(MagicNumber==0)?101010:MagicNumber;HandleRSI=iRSI(SymbolTrade,PERIOD_CURRENT,RSIPeriod,PRICE_CLOSE);HandleMA=iMA(SymbolTrade,PERIOD_CURRENT,MAPeriod,0,MODE_SMA,PRICE_CLOSE);InitialBalance=AccountInfoDouble(ACCOUNT_BALANCE);PeakEquity=MathMax(InitialBalance,AccountInfoDouble(ACCOUNT_EQUITY));HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;MaxBasketProfitSeen=0.0;BuyDirectionLocked=false;SellDirectionLocked=false;HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}PrintFormat("[INIT] GRIDMaster v7.005 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());return INIT_SUCCEEDED;}
+int OnInit(){SymbolTrade=_Symbol;OrdersID=(MagicNumber==0)?101010:MagicNumber;HandleRSI=iRSI(SymbolTrade,PERIOD_CURRENT,RSIPeriod,PRICE_CLOSE);HandleMA=iMA(SymbolTrade,PERIOD_CURRENT,MAPeriod,0,MODE_SMA,PRICE_CLOSE);InitialBalance=AccountInfoDouble(ACCOUNT_BALANCE);PeakEquity=MathMax(InitialBalance,AccountInfoDouble(ACCOUNT_EQUITY));HighWaterMark=InitialBalance;ReductionActions=0;LastMidPrice=0.0;MaxBasketProfitSeen=0.0;BuyDirectionLocked=false;SellDirectionLocked=false;HardProtectionActive=false;IsTerminated=false;AnomalyBrakeActive=false;CurrentState=STATE_NORMAL;if(HandleRSI==INVALID_HANDLE||HandleMA==INVALID_HANDLE){Print("[INIT] Indicator initialization failed");return INIT_FAILED;}PrintFormat("[INIT] GRIDMaster v7.006 | Balance=%.2f | Hard=%.2f%% | Soft=%.2f%% | Reduce=%.2f%% | Emergency=%.2f%%",InitialBalance,HardLimit(),SoftLimit(),ReduceLimit(),EmergencyLimit());return INIT_SUCCEEDED;}
 void OnDeinit(const int reason){if(HandleRSI!=INVALID_HANDLE)IndicatorRelease(HandleRSI);if(HandleMA!=INVALID_HANDLE)IndicatorRelease(HandleMA);Comment("");}
 
 //================================================================================================//
@@ -178,9 +179,59 @@ ulong LargestLosingTicketBySide(ENUM_POSITION_TYPE wantedType){ulong best=0;doub
 void SetRecoveryFreeze(){int freezeSeconds=(int)MathMax(RecoveryFreezeSec,SURVIVAL_REENTRY_FREEZE_SEC);FreezeGridUntil=TimeCurrent()+freezeSeconds;}
 
 //================================================================================================//
-// RECOVERY GOVERNOR
+// RECOVERY GOVERNOR V2
 //================================================================================================//
-void RecoveryGovernor(double dd){if(BuyOrders+SellOrders==0)return;if(TimeCurrent()<FreezeGridUntil)return;if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec)return;double buyLoss=BasketLoss(POSITION_TYPE_BUY),sellLoss=BasketLoss(POSITION_TYPE_SELL),basketProfit=BuyProfits+SellProfits,basketLoss=(basketProfit<0.0)?-basketProfit:0.0;if(basketProfit>=0.0)return;if(MaxBasketLossUSD>0.0&&basketLoss>=MaxBasketLossUSD){CloseAllManaged("MAX-BASKET-LOSS");UpdateStatus();RecoveryActionThisTick=true;SetRecoveryFreeze();if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}PrintFormat("[PROTECTION] MAX BASKET LOSS | DD=%.2f%% | Loss=%.2f | CLOSE ALL",dd,basketLoss);return;}bool maxGridReached=(BuyOrders>=MaxOrders||SellOrders>=MaxOrders);if(maxGridReached&&CatastrophicBasketLossUSD>0.0&&basketLoss>=CatastrophicBasketLossUSD){CloseAllManaged("CATASTROPHIC-BASKET");UpdateStatus();RecoveryActionThisTick=true;if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}PrintFormat("[PROTECTION] CATASTROPHIC BASKET | DD=%.2f%% | Loss=%.2f | EA LOCKED",dd,basketLoss);return;}if(dd<RecoveryStartDD&&basketLoss<MinRecoveryLossUSD)return;if(ReductionActions>=MaxReductionActions)return;bool survival=(dd>=SurvivalDD);if(survival&&SurvivalBasketLossUSD>0.0&&basketLoss>=SurvivalBasketLossUSD){CloseAllManaged("SURVIVAL-BASKET");UpdateStatus();RecoveryActionThisTick=true;if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}PrintFormat("[PROTECTION] SURVIVAL BASKET EXIT | DD=%.2f%% | Loss=%.2f",dd,basketLoss);return;}if(basketLoss<MinRecoveryLossUSD&&dd<AggressiveRecoveryDD&&!survival)return;if(ReduceLargestLoser("RECOVERY"))return;}
+void RecoveryGovernor(double dd){
+   if(BuyOrders+SellOrders==0)return;
+   double basketProfit=BuyProfits+SellProfits;
+   double basketLoss=(basketProfit<0.0)?-basketProfit:0.0;
+   if(basketProfit>=0.0)return;
+
+   // HARD basket protection is never blocked by cooldown/freeze.
+   if(MaxBasketLossUSD>0.0&&basketLoss>=MaxBasketLossUSD){
+      CloseAllManaged("MAX-BASKET-LOSS");
+      UpdateStatus(); RecoveryActionThisTick=true; SetRecoveryFreeze();
+      if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}
+      PrintFormat("[PROTECTION] MAX BASKET LOSS | DD=%.2f%% | FloatingLoss=%.2f | CLOSE ALL",dd,basketLoss);
+      return;
+   }
+
+   bool maxGridReached=(BuyOrders>=MaxOrders||SellOrders>=MaxOrders);
+   if(maxGridReached&&CatastrophicBasketLossUSD>0.0&&basketLoss>=CatastrophicBasketLossUSD){
+      CloseAllManaged("CATASTROPHIC-BASKET");
+      UpdateStatus(); RecoveryActionThisTick=true; SetRecoveryFreeze();
+      if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}
+      PrintFormat("[PROTECTION] CATASTROPHIC BASKET | DD=%.2f%% | FloatingLoss=%.2f | EA LOCKED",dd,basketLoss);
+      return;
+   }
+
+   // Recovery actions are deliberately slower than hard protection.
+   if(TimeCurrent()<FreezeGridUntil)return;
+   if((TimeCurrent()-LastRecoveryAction)<RecoveryCooldownSec)return;
+   if(ReductionActions>=MaxReductionActions)return;
+
+   bool survival=(dd>=SurvivalDD);
+   if(survival&&SurvivalBasketLossUSD>0.0&&basketLoss>=SurvivalBasketLossUSD){
+      CloseAllManaged("SURVIVAL-BASKET");
+      UpdateStatus(); RecoveryActionThisTick=true; SetRecoveryFreeze();
+      if(BuyOrders==0&&SellOrders==0){CurrentState=STATE_LOCKED;IsTerminated=true;}
+      PrintFormat("[PROTECTION] SURVIVAL BASKET EXIT | DD=%.2f%% | FloatingLoss=%.2f",dd,basketLoss);
+      return;
+   }
+
+   if(dd<RecoveryStartDD)return;
+   if(basketLoss<MinRecoveryLossUSD)return;
+
+   ulong loser=LargestLosingTicket();
+   if(loser==0||!PositionSelectByTicket(loser))return;
+   double largestLoss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));
+   double concentration=(basketLoss>0.0)?largestLoss/basketLoss:0.0;
+   // At normal recovery DD, only cut a position that materially dominates risk.
+   // At aggressive DD, allow reduction even when losses are distributed.
+   if(dd<AggressiveRecoveryDD&&concentration<RecoveryConcentrationRatio)return;
+
+   if(ReduceLargestLoser("RECOVERY"))return;
+}
 
 //================================================================================================//
 // REDUCE ONE SIDE
@@ -189,15 +240,59 @@ bool ReduceLargestLosingSide(ENUM_POSITION_TYPE type,string reason){ulong t=Larg
 bool ReduceLargestLoser(string reason){ulong t=LargestLosingTicket();if(t==0||!PositionSelectByTicket(t))return false;ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);double loss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP)),vol=PositionGetDouble(POSITION_VOLUME);if(!ClosePosition(t,reason))return false;LockDirection(type,reason);ReductionActions++;LastRecoveryAction=TimeCurrent();SetRecoveryFreeze();RecoveryActionThisTick=true;PrintFormat("[REDUCE] %s | ticket=%I64u | side=%s | lot=%.4f | loss=%.2f | action=%d/%d | freeze=%ds",reason,t,EnumToString(type),vol,loss,ReductionActions,MaxReductionActions,(int)MathMax(RecoveryFreezeSec,SURVIVAL_REENTRY_FREEZE_SEC));return true;}
 
 //================================================================================================//
-// CLOSE ENGINE
+// CLOSE ENGINE V2
 //================================================================================================//
-void CloseSide(ENUM_POSITION_TYPE type,string reason){for(int pass=0;pass<10;pass++){bool found=false,changed=false;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(!PositionSelectByTicket(t))continue;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=type)continue;found=true;if(ClosePosition(t,reason))changed=true;}if(!found||!changed)break;}}
-void CloseAllManaged(string reason){CloseSide(POSITION_TYPE_BUY,reason);CloseSide(POSITION_TYPE_SELL,reason);}
+void CloseSide(ENUM_POSITION_TYPE type,string reason){
+   for(int pass=0;pass<10;pass++){
+      bool found=false,changed=false;
+      for(int i=PositionsTotal()-1;i>=0;i--){
+         ulong t=PositionGetTicket(i); if(!PositionSelectByTicket(t))continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;
+         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=type)continue;
+         found=true; if(ClosePosition(t,reason))changed=true;
+      }
+      if(!found||!changed)break;
+   }
+}
+
+// Basket close: close profitable exposure first, then losing exposure.
+// This banks available hedge/profit before price can move against the basket.
+bool CloseBestAvailable(string reason,bool wantProfit){
+   ulong best=0; double bestScore=-1.0;
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      ulong t=PositionGetTicket(i); if(!PositionSelectByTicket(t))continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)continue;
+      double p=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+      if(wantProfit&&p<=0.0)continue;
+      if(!wantProfit&&p>=0.0)continue;
+      double score=wantProfit?p:-p;
+      if(best==0||score>bestScore){best=t;bestScore=score;}
+   }
+   if(best==0)return false;
+   return ClosePosition(best,reason);
+}
+
+void CloseAllManaged(string reason){
+   // Re-snapshot before every close. This avoids stale ticket/volume state and
+   // makes the basket close resilient to partial fills and fast XAUUSD ticks.
+   for(int pass=0;pass<20;pass++){
+      UpdateStatus();
+      if(BuyOrders+SellOrders==0)return;
+      bool changed=false;
+      if(CloseBestAvailable(reason,true))changed=true;
+      else if(CloseBestAvailable(reason,false))changed=true;
+      if(!changed)break;
+   }
+   UpdateStatus();
+   if(BuyOrders+SellOrders>0)
+      PrintFormat("[CLOSE] BASKET INCOMPLETE | reason=%s | BUY=%d | SELL=%d | floating=%.2f",reason,BuyOrders,SellOrders,BuyProfits+SellProfits);
+}
+
 bool ClosePosition(ulong ticket,string reason){if(ticket==0||!PositionSelectByTicket(ticket))return false;if(PositionGetInteger(POSITION_MAGIC)!=OrdersID||PositionGetString(POSITION_SYMBOL)!=SymbolTrade)return false;ENUM_POSITION_TYPE ptype=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);ENUM_ORDER_TYPE type=(ptype==POSITION_TYPE_BUY)?ORDER_TYPE_SELL:ORDER_TYPE_BUY;double vol=PositionGetDouble(POSITION_VOLUME);if(vol<=0)return false;double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK);if(bid<=0||ask<=0)return false;MqlTradeRequest req={};MqlTradeResult res={};req.action=TRADE_ACTION_DEAL;req.position=ticket;req.symbol=SymbolTrade;req.magic=OrdersID;req.volume=vol;req.type=type;req.price=(type==ORDER_TYPE_BUY)?ask:bid;req.deviation=30;req.type_filling=SafeFilling();req.comment=reason;ResetLastError();bool sent=OrderSend(req,res);if(!sent||!TradeOK(res.retcode)){PrintFormat("[CLOSE] FAILED | ticket=%I64u | %s | rc=%u | %s | err=%d",ticket,reason,res.retcode,res.comment,GetLastError());return false;}PrintFormat("[CLOSE] SUCCESS | ticket=%I64u | %s | volume=%.4f | rc=%u",ticket,reason,res.volume,res.retcode);return true;}
 
 //================================================================================================//
 // DASHBOARD
 //================================================================================================//
 string StateText(){if(CurrentState==STATE_MONITOR)return "MONITOR";if(CurrentState==STATE_REDUCE)return "REDUCE";if(CurrentState==STATE_SURVIVAL)return "SURVIVAL";if(CurrentState==STATE_EMERGENCY)return "EMERGENCY";if(CurrentState==STATE_LOCKED)return "LOCKED";return "NORMAL";}
-void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.005 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","BUY LOCK: ",(BuyDirectionLocked?"YES":"NO")," | SELL LOCK: ",(SellDirectionLocked?"YES":"NO"),"\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
+void Dashboard(double dd){double bid=SymbolInfoDouble(SymbolTrade,SYMBOL_BID),ask=SymbolInfoDouble(SymbolTrade,SYMBOL_ASK),spread=0;if(bid>0&&ask>0&&_Point>0)spread=(ask-bid)/_Point;Comment("======== GRIDMaster v7.006 ========\n","Status: ",(IsTerminated?"LOCKED":"RUNNING"),"\n","State: ",StateText(),"\n","DD: ",DoubleToString(dd,2),"%\n","Peak: ",DoubleToString(PeakEquity,2),"\n","Hard: ",DoubleToString(HardLimit(),2),"% | Soft: ",DoubleToString(SoftLimit(),2),"%\n","Reduce: ",DoubleToString(ReduceLimit(),2),"% | Emergency: ",DoubleToString(EmergencyLimit(),2),"%\n","Exposure: ",DoubleToString(TotalExposureLots(),2)," lots | Spread: ",DoubleToString(spread,1)," pts\n","BUY LOCK: ",(BuyDirectionLocked?"YES":"NO")," | SELL LOCK: ",(SellDirectionLocked?"YES":"NO"),"\n","Anomaly: ",(AnomalyBrakeActive?"BRAKE":"OK")," | Freeze: ",TimeToString(FreezeGridUntil,TIME_SECONDS),"\n","BUY: ",BuyOrders," | ",DoubleToString(BuyProfits,2),"\n","SELL: ",SellOrders," | ",DoubleToString(SellProfits,2),"\n","==================================");}
 //================================================================================================//
