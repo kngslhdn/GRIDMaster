@@ -1,0 +1,49 @@
+name: GRIDMaster v7.007b patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-v7-007b.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch source
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          p=Path('GRIDMaster.mq5')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('v7.006 - RECOVERY V2 + SAFE BASKET CLOSE ENGINE + CATASTROPHIC PROTECTION','v7.007 - RECOVERY V3 + LOSS-TRIGGERED RECOVERY + PROTECTION CLOSE')
+          s=s.replace('#property version "7.006"','#property version "7.007"')
+          marker='input double MinRecoveryLossUSD=20.0;'
+          if 'RecoveryLossTriggerUSD' not in s:
+              s=s.replace(marker,marker+'\ninput double RecoveryLossTriggerUSD=20.0;\ninput double RecoveryDistributedLossTriggerUSD=30.0;',1)
+          pattern=r'\s*if\(dd<RecoveryStartDD\)return;\s*if\(basketLoss<MinRecoveryLossUSD\)return;\s*ulong loser=LargestLosingTicket\(\);.*?if\(ReduceLargestLoser\("RECOVERY"\)\)return;'
+          replacement='''\n   // V3: trigger recovery from floating basket loss even when account DD is still low.\n   bool lossTrigger=(RecoveryLossTriggerUSD>0.0 && basketLoss>=RecoveryLossTriggerUSD);\n   bool ddTrigger=(dd>=RecoveryStartDD);\n   if(!lossTrigger && !ddTrigger)return;\n   if(basketLoss<MinRecoveryLossUSD)return;\n\n   ulong loser=LargestLosingTicket();\n   if(loser==0||!PositionSelectByTicket(loser))return;\n   double largestLoss=-(PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP));\n   double concentration=(basketLoss>0.0)?largestLoss/basketLoss:0.0;\n   // At low DD, allow a reduction only when one loser dominates or the distributed\n   // basket loss has grown materially. This creates recovery before the $60 hard exit.\n   if(dd<AggressiveRecoveryDD && concentration<RecoveryConcentrationRatio &&\n      basketLoss<RecoveryDistributedLossTriggerUSD)return;\n\n   if(ReduceLargestLoser(lossTrigger?"RECOVERY-LOSS-TRIGGER":"RECOVERY-DD"))return;'''
+          ns,n=re.subn(pattern,replacement,s,count=1,flags=re.S)
+          if n!=1: raise SystemExit('Recovery target not found')
+          s=ns
+          pattern2=r'void CloseAllManaged\(string reason\)\{.*?\n\}\n\nbool ClosePosition'
+          replacement2='''void CloseAllManaged(string reason){\n   // Protection exits close the largest losing exposure first. This preserves a\n   // profitable hedge until the risk position is reduced, instead of removing the\n   // hedge first and leaving the loser exposed to a fast XAUUSD move.\n   bool protection=(StringFind(reason,"MAX-BASKET")>=0 || StringFind(reason,"CATASTROPHIC")>=0 ||\n                    StringFind(reason,"EMERGENCY")>=0 || StringFind(reason,"HARD-DD")>=0 ||\n                    StringFind(reason,"SURVIVAL")>=0 || StringFind(reason,"RECOVERY")>=0);\n   for(int pass=0;pass<20;pass++){\n      UpdateStatus();\n      if(BuyOrders+SellOrders==0)return;\n      bool changed=false;\n      if(protection){\n         if(CloseBestAvailable(reason,false))changed=true;\n         else if(CloseBestAvailable(reason,true))changed=true;\n      }else{\n         if(CloseBestAvailable(reason,true))changed=true;\n         else if(CloseBestAvailable(reason,false))changed=true;\n      }\n      if(!changed)break;\n   }\n   UpdateStatus();\n   if(BuyOrders+SellOrders>0)\n      PrintFormat("[CLOSE] BASKET INCOMPLETE | reason=%s | BUY=%d | SELL=%d | floating=%.2f",reason,BuyOrders,SellOrders,BuyProfits+SellProfits);\n}\n\nbool ClosePosition'''
+          ns,n=re.subn(pattern2,replacement2,s,count=1,flags=re.S)
+          if n!=1: raise SystemExit('CloseAllManaged target not found')
+          s=ns
+          s=s.replace('GRIDMaster v7.006','GRIDMaster v7.007')
+          p.write_text(s,encoding='utf-8')
+          Path('.github/workflows/fix-v7-007b.yml').unlink()
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GRIDMaster.mq5 .github/workflows/fix-v7-007b.yml
+          git diff --cached --quiet && exit 1 || true
+          git commit -m 'Fix recovery loss trigger and protection basket close'
+          git push
