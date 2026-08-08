@@ -7,10 +7,11 @@
 // TRADE RESULT VALIDATION FIX
 // SYMBOL / FILLING / VOLUME SAFETY FIX
 // RECOVERY REDUCE EXPOSURE FIX
+// RECOVERY EXIT ENGINE AUDIT FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.007"
+#property version   "6.008"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -293,7 +294,6 @@ void ManageExit(bool recovery)
 
    if(BuyOrders == 0)
       MaxBuyProfitSeen = 0;
-
    if(SellOrders == 0)
       MaxSellProfitSeen = 0;
 
@@ -638,7 +638,6 @@ ulong FindBestRecoveryPosition(ENUM_POSITION_TYPE type)
       double volume = PositionGetDouble(POSITION_VOLUME);
       datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
 
-      // Prefer the largest absolute floating loss. Volume and age are only tie-breakers.
       if(loss > worstLoss + 0.00000001 ||
          (MathAbs(loss - worstLoss) <= 0.00000001 && volume > bestVolume) ||
          (MathAbs(loss - worstLoss) <= 0.00000001 && MathAbs(volume - bestVolume) <= 0.00000001 && (oldestTime == 0 || openTime < oldestTime)))
@@ -651,11 +650,7 @@ ulong FindBestRecoveryPosition(ENUM_POSITION_TYPE type)
    }
 
    if(bestTicket > 0 && worstLoss < MinRecoveryLossUSD)
-   {
-      // Below the configured minimum, do not realize a small loss unless
-      // the basket has reached SurvivalDD. This keeps normal recovery selective.
       return 0;
-   }
 
    return bestTicket;
 }
@@ -722,6 +717,8 @@ void RecoveryExitEngine(double currentDrawdown)
    if(currentDrawdown < RecoveryStartDD)
       return;
 
+   // One successful recovery action establishes the cooldown. Do not allow
+   // a second reduction on the same tick, even if both BUY and SELL qualify.
    if((TimeCurrent() - LastRecoveryAction) < RecoveryCooldownSec)
       return;
 
@@ -729,6 +726,8 @@ void RecoveryExitEngine(double currentDrawdown)
    double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
    if(bid <= 0 || ask <= 0)
       return;
+
+   bool survivalMode = (currentDrawdown >= SurvivalDD);
 
    //================ BUY RECOVERY =================
    if(BuyOrders >= 2 && BuyProfits < 0)
@@ -744,14 +743,43 @@ void RecoveryExitEngine(double currentDrawdown)
       {
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_BUY);
 
-         // Keep one final layer as the recovery anchor; reduce from N -> N-1.
+         // In survival mode, allow reduction even when the worst individual
+         // loss is below MinRecoveryLossUSD. The basket DD has priority.
+         if(ticket == 0 && survivalMode)
+         {
+            ticket = FindBestRecoveryPosition(POSITION_TYPE_BUY);
+            if(ticket == 0)
+            {
+               // Find the worst losing BUY without the minimum-loss gate.
+               double worstLoss = 0.0;
+               for(int i = PositionsTotal() - 1; i >= 0; i--)
+               {
+                  ulong t = PositionGetTicket(i);
+                  if(!PositionSelectByTicket(t)) continue;
+                  if(PositionGetInteger(POSITION_MAGIC) != OrdersID) continue;
+                  if(PositionGetString(POSITION_SYMBOL) != SymbolTrade) continue;
+                  if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+
+                  double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+                  if(p >= 0) continue;
+                  double loss = -p;
+                  if(loss > worstLoss)
+                  {
+                     worstLoss = loss;
+                     ticket = t;
+                  }
+               }
+            }
+         }
+
          if(ticket > 0 && BuyOrders > 1)
          {
             if(CloseRecoveryPosition(ticket))
             {
                LowestPriceAfterBuy = bid;
                CurrentRecoveryState = RECOVERY_COOLDOWN;
-               PrintFormat("[REE] BUY exposure reduced | Remaining BUY layers expected <= %d", BuyOrders - 1);
+               PrintFormat("[REE] BUY exposure reduced | DD=%.2f%% | Survival=%s | Remaining BUY layers expected <= %d", currentDrawdown, survivalMode ? "ON" : "OFF", BuyOrders - 1);
+               return;
             }
          }
       }
@@ -775,14 +803,36 @@ void RecoveryExitEngine(double currentDrawdown)
       {
          ulong ticket = FindBestRecoveryPosition(POSITION_TYPE_SELL);
 
-         // Keep one final layer as the recovery anchor; reduce from N -> N-1.
+         if(ticket == 0 && survivalMode)
+         {
+            double worstLoss = 0.0;
+            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            {
+               ulong t = PositionGetTicket(i);
+               if(!PositionSelectByTicket(t)) continue;
+               if(PositionGetInteger(POSITION_MAGIC) != OrdersID) continue;
+               if(PositionGetString(POSITION_SYMBOL) != SymbolTrade) continue;
+               if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+
+               double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+               if(p >= 0) continue;
+               double loss = -p;
+               if(loss > worstLoss)
+               {
+                  worstLoss = loss;
+                  ticket = t;
+               }
+            }
+         }
+
          if(ticket > 0 && SellOrders > 1)
          {
             if(CloseRecoveryPosition(ticket))
             {
                HighestPriceAfterSell = ask;
                CurrentRecoveryState = RECOVERY_COOLDOWN;
-               PrintFormat("[REE] SELL exposure reduced | Remaining SELL layers expected <= %d", SellOrders - 1);
+               PrintFormat("[REE] SELL exposure reduced | DD=%.2f%% | Survival=%s | Remaining SELL layers expected <= %d", currentDrawdown, survivalMode ? "ON" : "OFF", SellOrders - 1);
+               return;
             }
          }
       }
