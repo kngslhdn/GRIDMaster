@@ -11,10 +11,11 @@
 // RECOVERY STATE MACHINE FIX
 // RECOVERY BASKET-LOSS REDUCTION FIX
 // RECOVERY EXPOSURE REDUCTION FIX
+// HARD PROTECTION LATCH FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.011"
+#property version   "6.012"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -27,7 +28,7 @@ input double TrailingStopUSD      = 2.0;
 
 input string RSI_Settings         = "||========== INDICATORS ==========||";
 input int    MAPeriod             = 200;
-input int    RSIPeriod            = 14;
+input int    RSIPeriod             = 14;
 input int    RSIUpper             = 70;
 input int    RSILower             = 30;
 
@@ -62,6 +63,7 @@ double BuyProfits, SellProfits;
 double PriceOpenLastBuy, PriceOpenLastSell;
 
 bool     IsTerminated = false;
+bool     HardProtectionActive = false;
 double   HighWaterMark = 0;
 datetime FreezeGridUntil = 0;
 
@@ -106,6 +108,7 @@ int OnInit()
    AdaptiveEquityBase = InitialBalance;
    LockedProfit = 0;
    CurrentRecoveryState = RECOVERY_OFF;
+   HardProtectionActive = false;
 
    if(HandleRSI == INVALID_HANDLE || HandleMA == INVALID_HANDLE)
    {
@@ -152,11 +155,22 @@ void OnTick()
       currentDrawdown = ((AdaptiveEquityBase - equity) / AdaptiveEquityBase) * 100.0;
 
    //========================================================
-   // 24/7 EQUITY PROTECTION
+   // HARD EQUITY PROTECTION LATCH
+   // Once the hard threshold is reached, protection remains
+   // active until all managed positions are confirmed closed.
    //========================================================
    if(currentDrawdown >= MaxEquityLossPercent)
    {
-      PrintFormat("!!! EMERGENCY CUT LOSS: Drawdown %.2f%% !!!", currentDrawdown);
+      if(!HardProtectionActive)
+      {
+         HardProtectionActive = true;
+         PrintFormat("[PROTECTION] HARD LATCH ACTIVATED | DD=%.2f%% >= %.2f%%", currentDrawdown, MaxEquityLossPercent);
+      }
+   }
+
+   if(HardProtectionActive)
+   {
+      PrintFormat("[PROTECTION] HARD LATCH ACTIVE | DD=%.2f%% | BUY=%d SELL=%d | Closing all managed positions", currentDrawdown, BuyOrders, SellOrders);
 
       CloseAllOrders();
       UpdateStatus();
@@ -165,11 +179,11 @@ void OnTick()
       {
          IsTerminated = true;
          CurrentRecoveryState = RECOVERY_OFF;
-         Print("[PROTECTION] All managed positions closed. EA terminated for safety.");
+         Print("[PROTECTION] Hard protection complete. All managed positions closed. EA terminated for safety.");
       }
       else
       {
-         PrintFormat("[PROTECTION] Close incomplete. BUY=%d SELL=%d. Retrying on next tick.", BuyOrders, SellOrders);
+         PrintFormat("[PROTECTION] Close incomplete. BUY=%d SELL=%d. HARD LATCH remains active; retrying on next tick.", BuyOrders, SellOrders);
       }
 
       DisplayDashboard(currentDrawdown, GetRSIValue(), IsInRecovery);
@@ -542,7 +556,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE type)
       PrintFormat("[OPEN] Trade rejected %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u", EnumToString(type), SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
       return;
    }
-   PrintFormat("[OPEN] Trade executed %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u", EnumToString(type), SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
+   PrintFormat("[OPEN] Trade executed %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u", EnumToString(type), SymbolTrade, volume, req.type_filling, res.retcode, res.order, res.deal);
 }
 
 //================================================================================================//
