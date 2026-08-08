@@ -5,10 +5,11 @@
 // TRAILING STATE FIX
 // LAST GRID PRICE FIX
 // TRADE RESULT VALIDATION FIX
+// SYMBOL / FILLING / VOLUME SAFETY FIX
 //================================================================================================//
 #property strict
 #property copyright "Copyright 2026, Jarvis"
-#property version   "6.005"
+#property version   "6.006"
 
 enum Type {Open_Buy_And_Sell, Open__Only_Buy, Open__Only_Sell};
 enum RecoveryState { RECOVERY_OFF = 0, RECOVERY_MONITOR, RECOVERY_ACTIVE, RECOVERY_COOLDOWN };
@@ -21,9 +22,9 @@ input double TrailingStopUSD      = 2.0;
 
 input string RSI_Settings         = "||========== INDICATORS ==========||";
 input int    MAPeriod             = 200;
-input int    RSIPeriod            = 14;
-input int    RSIUpper             = 70;
-input int    RSILower             = 30;
+input int    RSIPeriod             = 14;
+input int    RSIUpper              = 70;
+input int    RSILower              = 30;
 
 input string Grid_Settings        = "||========== GRID LOGIC ==========||";
 input Type   TypeOrdersPlace      = Open_Buy_And_Sell;
@@ -365,41 +366,170 @@ bool IsMarketTradeSuccess(uint retcode)
 }
 
 //================================================================================================//
+ENUM_ORDER_TYPE_FILLING GetSafeFillingMode()
+{
+   long filling = 0;
+
+   if(!SymbolInfoInteger(SymbolTrade, SYMBOL_FILLING_MODE, filling))
+   {
+      PrintFormat("[SAFETY] Cannot read SYMBOL_FILLING_MODE for %s", SymbolTrade);
+      return ORDER_FILLING_FOK;
+   }
+
+   // Prefer IOC when the broker/symbol explicitly supports it.
+   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+
+   // RETURN is valid for non-market execution modes. For MARKET execution
+   // it is not allowed, so keep FOK as the safest fallback.
+   long execution = 0;
+   SymbolInfoInteger(SymbolTrade, SYMBOL_TRADE_EXEMODE, execution);
+
+   if(execution != SYMBOL_TRADE_EXECUTION_MARKET)
+      return ORDER_FILLING_RETURN;
+
+   return ORDER_FILLING_FOK;
+}
+
+//================================================================================================//
+int GetVolumeDigits()
+{
+   double step = SymbolInfoDouble(SymbolTrade, SYMBOL_VOLUME_STEP);
+   int digits = 0;
+
+   while(digits < 8 && MathAbs(step - NormalizeDouble(step, digits)) > 0.00000001)
+      digits++;
+
+   return digits;
+}
+
+//================================================================================================//
+double NormalizeTradeVolume(double requestedVolume)
+{
+   double minVolume = SymbolInfoDouble(SymbolTrade, SYMBOL_VOLUME_MIN);
+   double maxVolume = SymbolInfoDouble(SymbolTrade, SYMBOL_VOLUME_MAX);
+   double step      = SymbolInfoDouble(SymbolTrade, SYMBOL_VOLUME_STEP);
+
+   if(minVolume <= 0 || maxVolume <= 0 || step <= 0)
+   {
+      PrintFormat("[SAFETY] Invalid volume specification for %s | Min=%.8f Max=%.8f Step=%.8f",
+                  SymbolTrade, minVolume, maxVolume, step);
+      return 0.0;
+   }
+
+   if(requestedVolume < minVolume - 0.00000001)
+   {
+      PrintFormat("[SAFETY] Requested volume %.8f is below minimum %.8f for %s",
+                  requestedVolume, minVolume, SymbolTrade);
+      return 0.0;
+   }
+
+   double volume = MathMin(requestedVolume, maxVolume);
+
+   // Round DOWN to the broker's volume step so we never accidentally
+   // increase the requested risk because of normalization.
+   volume = MathFloor((volume + 0.0000000001) / step) * step;
+
+   if(volume < minVolume - 0.00000001)
+   {
+      PrintFormat("[SAFETY] Normalized volume %.8f became below minimum %.8f for %s",
+                  volume, minVolume, SymbolTrade);
+      return 0.0;
+   }
+
+   return NormalizeDouble(volume, GetVolumeDigits());
+}
+
+//================================================================================================//
+bool IsTradeEnvironmentSafe(ENUM_ORDER_TYPE type, double &price)
+{
+   if(!SymbolSelect(SymbolTrade, true))
+   {
+      PrintFormat("[SAFETY] SymbolSelect failed for %s", SymbolTrade);
+      return false;
+   }
+
+   ENUM_SYMBOL_TRADE_MODE tradeMode =
+      (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(SymbolTrade, SYMBOL_TRADE_MODE);
+
+   if(tradeMode == SYMBOL_TRADE_MODE_DISABLED || tradeMode == SYMBOL_TRADE_MODE_CLOSEONLY)
+   {
+      PrintFormat("[SAFETY] Trading disabled/close-only for %s | Mode=%d", SymbolTrade, tradeMode);
+      return false;
+   }
+
+   double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
+   double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+
+   if(bid <= 0 || ask <= 0 || ask < bid)
+   {
+      PrintFormat("[SAFETY] Invalid market price for %s | Bid=%.8f Ask=%.8f", SymbolTrade, bid, ask);
+      return false;
+   }
+
+   price = (type == ORDER_TYPE_BUY) ? ask : bid;
+
+   if(price <= 0)
+   {
+      PrintFormat("[SAFETY] Invalid execution price for %s", SymbolTrade);
+      return false;
+   }
+
+   return true;
+}
+
+//================================================================================================//
 void ExecuteTrade(ENUM_ORDER_TYPE type)
 {
-   MqlTradeRequest req = {};
-   MqlTradeResult  res = {};
+   double price = 0;
+
+   if(!IsTradeEnvironmentSafe(type, price))
+      return;
 
    int c = (type == ORDER_TYPE_BUY) ? BuyOrders : SellOrders;
+   double requestedVolume = ManualLotSize * (c + 1);
+   double volume = NormalizeTradeVolume(requestedVolume);
+
+   if(volume <= 0)
+   {
+      PrintFormat("[OPEN] Trade blocked: invalid volume %.8f for %s", requestedVolume, SymbolTrade);
+      return;
+   }
+
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
 
    req.action = TRADE_ACTION_DEAL;
    req.symbol = SymbolTrade;
    req.magic = OrdersID;
-   req.volume = NormalizeDouble(ManualLotSize * (c + 1), 2);
+   req.volume = volume;
    req.type = type;
+   req.price = price;
    req.deviation = 10;
-   req.type_filling = ORDER_FILLING_IOC;
+   req.type_filling = GetSafeFillingMode();
    req.comment = CommentsOrders;
-   req.price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_ASK) : SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
 
    ResetLastError();
 
    if(!OrderSend(req, res))
    {
-      PrintFormat("[OPEN] OrderSend failed %s | Error=%d | RetCode=%u | Comment=%s",
-                  EnumToString(type), GetLastError(), res.retcode, res.comment);
+      PrintFormat("[OPEN] OrderSend failed %s | Symbol=%s | Volume=%.8f | Filling=%d | Error=%d | RetCode=%u | Comment=%s",
+                  EnumToString(type), SymbolTrade, volume, req.type_filling, GetLastError(), res.retcode, res.comment);
       return;
    }
 
    if(!IsMarketTradeSuccess(res.retcode))
    {
-      PrintFormat("[OPEN] Trade rejected %s | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
-                  EnumToString(type), res.retcode, res.comment, res.order, res.deal);
+      PrintFormat("[OPEN] Trade rejected %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
+                  EnumToString(type), SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
       return;
    }
 
-   PrintFormat("[OPEN] Trade executed %s | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
-               EnumToString(type), res.retcode, res.order, res.deal, res.volume);
+   PrintFormat("[OPEN] Trade executed %s | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
+               EnumToString(type), SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
 }
 
 //================================================================================================//
@@ -421,6 +551,34 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != type)
          continue;
 
+      double volume = NormalizeTradeVolume(PositionGetDouble(POSITION_VOLUME));
+
+      if(volume <= 0)
+      {
+         PrintFormat("[CLOSE] Invalid close volume for #%I64u", t);
+         continue;
+      }
+
+      ENUM_ORDER_TYPE closeType =
+         (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+
+      double price = 0;
+      if(!IsTradeEnvironmentSafe(closeType, price))
+      {
+         // Close protection must still be attempted when the symbol is in
+         // CLOSEONLY mode. Re-read the actual side price without blocking.
+         double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
+         double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+
+         if(bid <= 0 || ask <= 0)
+         {
+            PrintFormat("[CLOSE] Cannot close #%I64u: invalid Bid/Ask", t);
+            continue;
+         }
+
+         price = (closeType == ORDER_TYPE_BUY) ? ask : bid;
+      }
+
       MqlTradeRequest req = {};
       MqlTradeResult  res = {};
 
@@ -428,31 +586,31 @@ void CloseOrdersByType(ENUM_POSITION_TYPE type)
       req.position = t;
       req.symbol = SymbolTrade;
       req.magic = OrdersID;
-      req.volume = PositionGetDouble(POSITION_VOLUME);
-      req.type = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-      req.price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+      req.volume = volume;
+      req.type = closeType;
+      req.price = price;
       req.deviation = 10;
-      req.type_filling = ORDER_FILLING_IOC;
+      req.type_filling = GetSafeFillingMode();
 
       ResetLastError();
       bool sent = OrderSend(req, res);
 
       if(!sent)
       {
-         PrintFormat("[CLOSE] OrderSend failed #%I64u | Error=%d | RetCode=%u | Comment=%s",
-                     t, GetLastError(), res.retcode, res.comment);
+         PrintFormat("[CLOSE] OrderSend failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Error=%d | RetCode=%u | Comment=%s",
+                     t, SymbolTrade, volume, req.type_filling, GetLastError(), res.retcode, res.comment);
          continue;
       }
 
       if(!IsMarketTradeSuccess(res.retcode))
       {
-         PrintFormat("[CLOSE] Trade rejected #%I64u | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
-                     t, res.retcode, res.comment, res.order, res.deal);
+         PrintFormat("[CLOSE] Trade rejected #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
+                     t, SymbolTrade, volume, req.type_filling, res.retcode, res.comment, res.order, res.deal);
          continue;
       }
 
-      PrintFormat("[CLOSE] Trade executed #%I64u | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
-                  t, res.retcode, res.order, res.deal, res.volume);
+      PrintFormat("[CLOSE] Trade executed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
+                  t, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
    }
 }
 
@@ -512,6 +670,23 @@ bool CloseRecoveryPosition(ulong ticket)
       return false;
 
    ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ENUM_ORDER_TYPE closeType = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+
+   double volume = NormalizeTradeVolume(PositionGetDouble(POSITION_VOLUME));
+   if(volume <= 0)
+      return false;
+
+   double price = 0;
+   double bid = SymbolInfoDouble(SymbolTrade, SYMBOL_BID);
+   double ask = SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+
+   if(bid <= 0 || ask <= 0)
+   {
+      PrintFormat("[REE] Cannot close #%I64u: invalid Bid/Ask", ticket);
+      return false;
+   }
+
+   price = (closeType == ORDER_TYPE_BUY) ? ask : bid;
 
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
@@ -520,35 +695,27 @@ bool CloseRecoveryPosition(ulong ticket)
    req.position = ticket;
    req.symbol = SymbolTrade;
    req.magic = OrdersID;
-   req.volume = PositionGetDouble(POSITION_VOLUME);
-   req.type = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   req.price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(SymbolTrade, SYMBOL_BID) : SymbolInfoDouble(SymbolTrade, SYMBOL_ASK);
+   req.volume = volume;
+   req.type = closeType;
+   req.price = price;
    req.deviation = 10;
-   req.type_filling = ORDER_FILLING_IOC;
+   req.type_filling = GetSafeFillingMode();
 
    ResetLastError();
    bool sent = OrderSend(req, res);
 
-   if(!sent)
+   if(sent && IsMarketTradeSuccess(res.retcode))
    {
-      PrintFormat("[REE] Recovery close OrderSend failed #%I64u | Error=%d | RetCode=%u | Comment=%s",
-                  ticket, GetLastError(), res.retcode, res.comment);
-      return false;
+      LastRecoveryAction = TimeCurrent();
+      FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
+      PrintFormat("[REE] Recovery Close Success #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | RetCode=%u | Order=%I64u | Deal=%I64u",
+                  ticket, SymbolTrade, res.volume, req.type_filling, res.retcode, res.order, res.deal);
+      return true;
    }
 
-   if(!IsMarketTradeSuccess(res.retcode))
-   {
-      PrintFormat("[REE] Recovery close rejected #%I64u | RetCode=%u | Comment=%s | Order=%I64u | Deal=%I64u",
-                  ticket, res.retcode, res.comment, res.order, res.deal);
-      return false;
-   }
-
-   LastRecoveryAction = TimeCurrent();
-   FreezeGridUntil = TimeCurrent() + RecoveryFreezeSec;
-
-   PrintFormat("[REE] Recovery Close Success #%I64u | RetCode=%u | Order=%I64u | Deal=%I64u | Volume=%.2f",
-               ticket, res.retcode, res.order, res.deal, res.volume);
-   return true;
+   PrintFormat("[REE] Recovery Close Failed #%I64u | Symbol=%s | Volume=%.8f | Filling=%d | Sent=%s | RetCode=%u | Comment=%s | Error=%d",
+               ticket, SymbolTrade, volume, req.type_filling, sent ? "true" : "false", res.retcode, res.comment, GetLastError());
+   return false;
 }
 
 //================================================================================================//
