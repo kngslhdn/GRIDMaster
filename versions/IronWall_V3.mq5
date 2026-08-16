@@ -744,9 +744,10 @@ void RepairEngine()
 
    if(positions == 0)
    {
-      if(OurPendingCount() != 1)
-         CreateInitialWall();
-
+      // Flat state is re-evaluated on every new bar. This prevents a
+      // stale pending order from surviving into a disabled session,
+      // stale trend regime, or failed volatility condition.
+      CreateInitialWall();
       return;
    }
 
