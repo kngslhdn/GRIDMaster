@@ -16,7 +16,7 @@ CTrade trade;
 //====================================================================
 input group "=== IRONWALL V1 ==="
 input double InpLotSize         = 0.01;
-input double InpDistancePrice   = 5.0;
+input double InpDistancePrice   = 10.0;
 input ulong  InpMagicNumber     = 26081601;
 input int    InpDeviationPoints = 30;
 
