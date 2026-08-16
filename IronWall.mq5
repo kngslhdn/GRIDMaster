@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                                   IronWall.mq5   |
-//|                  IronWall V1 - Dual Pending Engine               |
-//|                         Version 1.00                              |
+//|            IronWall V1 - Momentum Moving Wall Engine             |
+//|                         Version 1.10                              |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
-#property description "IronWall V1 - simple dual pending / reversal engine"
+#property version   "1.10"
+#property description "IronWall V1 - two-sided momentum wall with one active position"
 
 #include <Trade/Trade.mqh>
 
@@ -46,13 +46,15 @@ double MinStopDistance()
 
 double EffectiveDistance()
 {
-   double distance = MathMax(InpDistancePrice, 0.0);
-   const double minimum = MinStopDistance();
+   return MathMax(InpDistancePrice, MinStopDistance());
+}
 
-   if(distance < minimum)
-      distance = minimum;
+bool IsHedgingAccount()
+{
+   const ENUM_ACCOUNT_MARGIN_MODE mode =
+      (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
 
-   return distance;
+   return(mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
 }
 
 bool IsOurOrder(const ulong ticket)
@@ -63,7 +65,7 @@ bool IsOurOrder(const ulong ticket)
    if(OrderGetString(ORDER_SYMBOL) != _Symbol)
       return false;
 
-   return (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber;
+   return((ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber);
 }
 
 bool IsOurPosition(const ulong ticket)
@@ -74,7 +76,7 @@ bool IsOurPosition(const ulong ticket)
    if(PositionGetString(POSITION_SYMBOL) != _Symbol)
       return false;
 
-   return (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber;
+   return((ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber);
 }
 
 //====================================================================
@@ -87,6 +89,7 @@ int OurPositionCount()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       const ulong ticket = PositionGetTicket(i);
+
       if(IsOurPosition(ticket))
          count++;
    }
@@ -96,12 +99,10 @@ int OurPositionCount()
 
 bool GetOurPosition(ulong &ticket,
                     ENUM_POSITION_TYPE &type,
-                    double &openPrice,
-                    double &volume)
+                    double &openPrice)
 {
    ticket    = 0;
    openPrice = 0.0;
-   volume    = 0.0;
    type      = POSITION_TYPE_BUY;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -114,7 +115,7 @@ bool GetOurPosition(ulong &ticket,
       ticket    = positionTicket;
       type      = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      volume    = PositionGetDouble(POSITION_VOLUME);
+
       return true;
    }
 
@@ -162,28 +163,24 @@ void DeleteAllPending()
 
       if(!trade.OrderDelete(ticket))
       {
-         Print("IronWall: failed to delete pending #", ticket,
+         Print("IronWall: delete pending failed #", ticket,
                " retcode=", trade.ResultRetcode(),
                " ", trade.ResultRetcodeDescription());
       }
    }
 }
 
-bool PlaceBuyStop(const double price)
+bool PlaceBuyStop(const double requestedPrice)
 {
-   const double distance = EffectiveDistance();
-
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
       return false;
 
-   double buyPrice = price;
-   const double minimumPrice = tick.ask + distance;
+   const double distance = EffectiveDistance();
 
-   if(buyPrice < minimumPrice)
-      buyPrice = minimumPrice;
-
-   buyPrice = NormalizePrice(buyPrice);
+   double price = MathMax(requestedPrice, tick.ask + distance);
+   price = NormalizePrice(price);
 
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpDeviationPoints);
@@ -191,7 +188,7 @@ bool PlaceBuyStop(const double price)
 
    const bool ok = trade.BuyStop(
       InpLotSize,
-      buyPrice,
+      price,
       _Symbol,
       0.0,
       0.0,
@@ -202,7 +199,7 @@ bool PlaceBuyStop(const double price)
 
    if(!ok)
    {
-      Print("IronWall: BUY STOP failed. price=", buyPrice,
+      Print("IronWall: BUY STOP failed price=", price,
             " retcode=", trade.ResultRetcode(),
             " ", trade.ResultRetcodeDescription());
    }
@@ -210,21 +207,17 @@ bool PlaceBuyStop(const double price)
    return ok;
 }
 
-bool PlaceSellStop(const double price)
+bool PlaceSellStop(const double requestedPrice)
 {
-   const double distance = EffectiveDistance();
-
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
       return false;
 
-   double sellPrice = price;
-   const double minimumPrice = tick.bid - distance;
+   const double distance = EffectiveDistance();
 
-   if(sellPrice > minimumPrice)
-      sellPrice = minimumPrice;
-
-   sellPrice = NormalizePrice(sellPrice);
+   double price = MathMin(requestedPrice, tick.bid - distance);
+   price = NormalizePrice(price);
 
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpDeviationPoints);
@@ -232,7 +225,7 @@ bool PlaceSellStop(const double price)
 
    const bool ok = trade.SellStop(
       InpLotSize,
-      sellPrice,
+      price,
       _Symbol,
       0.0,
       0.0,
@@ -243,58 +236,7 @@ bool PlaceSellStop(const double price)
 
    if(!ok)
    {
-      Print("IronWall: SELL STOP failed. price=", sellPrice,
-            " retcode=", trade.ResultRetcode(),
-            " ", trade.ResultRetcodeDescription());
-   }
-
-   return ok;
-}
-
-//====================================================================
-// POSITION PROTECTION
-//====================================================================
-// BUY position:
-//   upper BUY STOP  = profit boundary / next BUY cycle
-//   lower SELL STOP  = loss boundary / reversal
-//
-// SELL position:
-//   upper BUY STOP   = loss boundary / reversal
-//   lower SELL STOP  = profit boundary / next SELL cycle
-bool SetPositionBoundaries(const double upperPrice,
-                           const double lowerPrice)
-{
-   ulong ticket;
-   ENUM_POSITION_TYPE type;
-   double openPrice;
-   double volume;
-
-   if(!GetOurPosition(ticket, type, openPrice, volume))
-      return false;
-
-   double sl = 0.0;
-   double tp = 0.0;
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      sl = NormalizePrice(lowerPrice);
-      tp = NormalizePrice(upperPrice);
-   }
-   else
-   {
-      sl = NormalizePrice(upperPrice);
-      tp = NormalizePrice(lowerPrice);
-   }
-
-   trade.SetExpertMagicNumber(InpMagicNumber);
-
-   const bool ok = trade.PositionModify(ticket, sl, tp);
-
-   if(!ok)
-   {
-      Print("IronWall: PositionModify failed. ticket=", ticket,
-            " SL=", sl,
-            " TP=", tp,
+      Print("IronWall: SELL STOP failed price=", price,
             " retcode=", trade.ResultRetcode(),
             " ", trade.ResultRetcodeDescription());
    }
@@ -305,16 +247,22 @@ bool SetPositionBoundaries(const double upperPrice,
 //====================================================================
 // INITIAL WALL
 //====================================================================
+// No position:
+//   BUY STOP  = above market
+//   SELL STOP = below market
+//
+// The first side touched becomes the active position.
 void CreateInitialWall()
 {
    if(g_busy || OurPositionCount() > 0)
       return;
 
-   const double distance = EffectiveDistance();
-
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
       return;
+
+   const double distance = EffectiveDistance();
 
    const double buyPrice  = NormalizePrice(tick.ask + distance);
    const double sellPrice = NormalizePrice(tick.bid - distance);
@@ -331,8 +279,21 @@ void CreateInitialWall()
 }
 
 //====================================================================
-// REBUILD WALL AROUND NEW POSITION
+// WALL AROUND ACTIVE POSITION
 //====================================================================
+// The wall is anchored to the ACTIVE POSITION OPEN PRICE.
+// It is NOT moved on every tick.
+//
+// BUY active at 4000:
+//   BUY STOP  = 4005  -> continuation / profit step
+//   SELL STOP = 3995  -> reversal / loss step
+//
+// SELL active at 4000:
+//   BUY STOP  = 4005  -> reversal / loss step
+//   SELL STOP = 3995  -> continuation / profit step
+//
+// This lets IronWall capture directional momentum without chasing
+// the market on every tick.
 void RebuildWallAroundPosition()
 {
    if(g_busy)
@@ -341,34 +302,77 @@ void RebuildWallAroundPosition()
    ulong ticket;
    ENUM_POSITION_TYPE type;
    double openPrice;
-   double volume;
 
-   if(!GetOurPosition(ticket, type, openPrice, volume))
+   if(!GetOurPosition(ticket, type, openPrice))
       return;
 
    const double distance = EffectiveDistance();
+
    const double upperPrice = NormalizePrice(openPrice + distance);
    const double lowerPrice = NormalizePrice(openPrice - distance);
 
    DeleteAllPending();
 
-   // Set position boundaries first, then place matching pending orders.
-   SetPositionBoundaries(upperPrice, lowerPrice);
-
    PlaceBuyStop(upperPrice);
    PlaceSellStop(lowerPrice);
 
-   Print("IronWall: WALL REBUILT | OPEN=", openPrice,
+   Print("IronWall: WALL | direction=",
+         type == POSITION_TYPE_BUY ? "BUY" : "SELL",
+         " | OPEN=", openPrice,
          " | BUY STOP=", upperPrice,
          " | SELL STOP=", lowerPrice);
 }
 
 //====================================================================
-// POSITION RESET
+// POSITION CLOSE ENGINE
 //====================================================================
+bool ClosePositionTicket(const ulong ticket)
+{
+   if(!IsOurPosition(ticket))
+      return true;
+
+   if(!trade.PositionClose(ticket))
+   {
+      Print("IronWall: close position failed #", ticket,
+            " retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   return true;
+}
+
+bool CloseAllExcept(const ulong keepTicket)
+{
+   bool success = true;
+
+   for(int pass = 0; pass < 3; pass++)
+   {
+      bool found = false;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         const ulong ticket = PositionGetTicket(i);
+
+         if(!IsOurPosition(ticket) || ticket == keepTicket)
+            continue;
+
+         found = true;
+
+         if(!ClosePositionTicket(ticket))
+            success = false;
+      }
+
+      if(!found)
+         break;
+   }
+
+   return success;
+}
+
 bool CloseAllOurPositions()
 {
-   bool allClosed = true;
+   bool success = true;
 
    for(int pass = 0; pass < 3; pass++)
    {
@@ -383,20 +387,15 @@ bool CloseAllOurPositions()
 
          found = true;
 
-         if(!trade.PositionClose(ticket))
-         {
-            Print("IronWall: failed to close position #", ticket,
-                  " retcode=", trade.ResultRetcode(),
-                  " ", trade.ResultRetcodeDescription());
-            allClosed = false;
-         }
+         if(!ClosePositionTicket(ticket))
+            success = false;
       }
 
       if(!found)
          break;
    }
 
-   return allClosed && OurPositionCount() == 0;
+   return success && OurPositionCount() == 0;
 }
 
 bool OpenMarketDirection(const ENUM_DEAL_TYPE direction)
@@ -414,22 +413,71 @@ bool OpenMarketDirection(const ENUM_DEAL_TYPE direction)
 
    if(!ok)
    {
-      Print("IronWall: market reopen failed. direction=",
+      Print("IronWall: market reopen failed direction=",
             direction == DEAL_TYPE_BUY ? "BUY" : "SELL",
             " retcode=", trade.ResultRetcode(),
             " ", trade.ResultRetcodeDescription());
-      return false;
    }
 
-   return true;
+   return ok;
 }
 
-bool ResetToTriggeredDirection(const ENUM_DEAL_TYPE direction)
+//====================================================================
+// TRIGGER HANDLER
+//====================================================================
+// SAME DIRECTION:
+//   BUY active + BUY STOP touched
+//   -> close old BUY
+//   -> keep newly triggered BUY
+//
+// OPPOSITE DIRECTION:
+//   BUY active + SELL STOP touched
+//   -> close old BUY
+//   -> keep newly triggered SELL
+//
+// Then rebuild the wall around the new active position.
+bool HandleTriggeredDeal(const ulong dealTicket)
 {
-   // Normalize the cycle to exactly ONE position with InpLotSize.
-   // This works consistently on netting and hedging accounts.
+   if(!HistoryDealSelect(dealTicket))
+      return false;
+
+   const ENUM_DEAL_TYPE direction =
+      (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+
+   if(direction != DEAL_TYPE_BUY && direction != DEAL_TYPE_SELL)
+      return false;
+
+   const ulong triggeredPositionTicket =
+      (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+
    DeleteAllPending();
 
+   //===============================================================
+   // HEDGING ACCOUNT
+   //===============================================================
+   // The triggered pending order has its own position ticket.
+   // Keep it and close every older IronWall position.
+   if(IsHedgingAccount())
+   {
+      if(!CloseAllExcept(triggeredPositionTicket))
+         return false;
+
+      if(!IsOurPosition(triggeredPositionTicket))
+      {
+         Print("IronWall: triggered position disappeared #",
+               triggeredPositionTicket);
+         return false;
+      }
+
+      return true;
+   }
+
+   //===============================================================
+   // NETTING ACCOUNT
+   //===============================================================
+   // Netting merges the new deal into the existing position, so
+   // there is no separate old ticket to keep. Normalize to one fresh
+   // market position in the triggered direction.
    if(!CloseAllOurPositions())
       return false;
 
@@ -450,17 +498,38 @@ void RepairEngine()
    const int positions = OurPositionCount();
    const int pending    = OurPendingCount();
 
-   // No position = exactly two pending orders.
    if(positions == 0)
    {
+      // Flat state must always have exactly two wall orders.
       if(pending != 2)
          CreateInitialWall();
 
       return;
    }
 
-   // Position active = exactly two pending orders.
-   if(positions == 1 && pending != 2)
+   // IronWall is designed around exactly one active position.
+   // If more than one exists, keep one and close the others.
+   if(positions > 1)
+   {
+      ulong keepTicket;
+      ENUM_POSITION_TYPE keepType;
+      double keepOpen;
+
+      if(GetOurPosition(keepTicket, keepType, keepOpen))
+      {
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            const ulong ticket = PositionGetTicket(i);
+
+            if(!IsOurPosition(ticket) || ticket == keepTicket)
+               continue;
+
+            ClosePositionTicket(ticket);
+         }
+      }
+   }
+
+   if(OurPendingCount() != 2)
       RebuildWallAroundPosition();
 }
 
@@ -493,6 +562,8 @@ void OnTradeTransaction(
    const ENUM_DEAL_ENTRY entry =
       (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
 
+   // Only react to a NEW ENTRY deal.
+   // EXIT deals from closing the previous position are ignored.
    if(entry != DEAL_ENTRY_IN)
       return;
 
@@ -502,23 +573,27 @@ void OnTradeTransaction(
    if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL)
       return;
 
-   // A BUY STOP or SELL STOP has just been triggered.
    g_busy = true;
 
-   Print("IronWall: TRIGGER | ",
-         dealType == DEAL_TYPE_BUY ? "BUY" : "SELL",
-         " deal=", trans.deal);
+   Print("==================================================");
+   Print("IronWall: MOMENTUM TRIGGER");
+   Print("Direction : ", dealType == DEAL_TYPE_BUY ? "BUY" : "SELL");
+   Print("Deal      : ", trans.deal);
+   Print("==================================================");
 
-   if(ResetToTriggeredDirection(dealType))
+   if(HandleTriggeredDeal(trans.deal))
    {
-      g_busy = false;
+      // Rebuild only after the old pending wall and old position
+      // have been normalized.
       RebuildWallAroundPosition();
-      return;
+   }
+   else
+   {
+      Print("IronWall: trigger handling failed. Repair pending.");
    }
 
-   Print("IronWall: trigger recovery failed. Repair will retry.");
-
    g_busy = false;
+
    RepairEngine();
 }
 
@@ -544,12 +619,12 @@ int OnInit()
    }
 
    Print("==================================================");
-   Print("IronWall V1 started");
+   Print("IronWall V1.10 started");
    Print("Symbol   : ", _Symbol);
    Print("Lot      : ", InpLotSize);
    Print("Distance : ", InpDistancePrice);
    Print("Magic    : ", InpMagicNumber);
-   Print("Mode     : DUAL PENDING / REVERSAL ENGINE");
+   Print("Mode     : MOMENTUM MOVING WALL");
    Print("Filters  : NONE");
    Print("==================================================");
 
@@ -560,11 +635,13 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
-   Print("IronWall V1 stopped. reason=", reason);
+   Print("IronWall V1.10 stopped. reason=", reason);
 }
 
 void OnTick()
 {
+   // No indicator, no trend filter, no spread filter.
+   // OnTick only repairs the two-sided wall.
    RepairEngine();
 }
 //+------------------------------------------------------------------+
