@@ -1,589 +1,570 @@
+//+------------------------------------------------------------------+
+//|                                                   IronWall.mq5   |
+//|                  IronWall V1 - Dual Pending Engine               |
+//|                         Version 1.00                              |
+//+------------------------------------------------------------------+
 #property strict
+#property version   "1.00"
+#property description "IronWall V1 - simple dual pending / reversal engine"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
-//==================================================
+//====================================================================
 // INPUTS
-//==================================================
+//====================================================================
+input group "=== IRONWALL V1 ==="
+input double InpLotSize         = 0.01;
+input double InpDistancePrice   = 5.0;
+input ulong  InpMagicNumber     = 26081601;
+input int    InpDeviationPoints = 30;
 
-input double Lots = 0.01;
-
-input int ATRPeriod = 14;
-
-input double EntryATRMultiplier = 0.5;
-
-input int MaxSpread = 300;
-
-input ulong MagicNumber = 20260616;
-
-input double SL_ATR_Multiplier = 0.8;
-
-input double BE_ATR_Multiplier = 0.5;
-
-input double TrailStartATR = 0.1;
-
-input double TrailATR = 0.5;
-
-input double MinATR = 1.0;
-
-input double TP_ATR_Multiplier = 1.2;
-
-input int CooldownMinutes = 30;
-
-//==================================================
+//====================================================================
 // GLOBALS
-//==================================================
+//====================================================================
+bool g_busy = false;
 
-int ATRHandle;
-datetime LastPendingTime = 0;
-datetime LastCloseTime = 0;
-int EMA50Handle;
-int EMA200Handle;
-int LastHistoryDeals = 0;
+//====================================================================
+// UTILITY
+//====================================================================
+double NormalizePrice(const double price)
+{
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
 
-//==================================================
-// ONINIT
-//==================================================
+double PointSize()
+{
+   return SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+}
 
+double MinStopDistance()
+{
+   const int stops = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   return stops * PointSize();
+}
+
+double EffectiveDistance()
+{
+   double distance = MathMax(InpDistancePrice, 0.0);
+   const double minimum = MinStopDistance();
+
+   if(distance < minimum)
+      distance = minimum;
+
+   return distance;
+}
+
+bool IsOurOrder(const ulong ticket)
+{
+   if(ticket == 0 || !OrderSelect(ticket))
+      return false;
+
+   if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+      return false;
+
+   return (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber;
+}
+
+bool IsOurPosition(const ulong ticket)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+      return false;
+
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+      return false;
+
+   return (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber;
+}
+
+//====================================================================
+// POSITION ENGINE
+//====================================================================
+int OurPositionCount()
+{
+   int count = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(IsOurPosition(ticket))
+         count++;
+   }
+
+   return count;
+}
+
+bool GetOurPosition(ulong &ticket,
+                    ENUM_POSITION_TYPE &type,
+                    double &openPrice,
+                    double &volume)
+{
+   ticket    = 0;
+   openPrice = 0.0;
+   volume    = 0.0;
+   type      = POSITION_TYPE_BUY;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong positionTicket = PositionGetTicket(i);
+
+      if(!IsOurPosition(positionTicket))
+         continue;
+
+      ticket    = positionTicket;
+      type      = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      volume    = PositionGetDouble(POSITION_VOLUME);
+      return true;
+   }
+
+   return false;
+}
+
+//====================================================================
+// PENDING ENGINE
+//====================================================================
+int OurPendingCount()
+{
+   int count = 0;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+
+      if(!IsOurOrder(ticket))
+         continue;
+
+      const ENUM_ORDER_TYPE type =
+         (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+
+      if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_STOP)
+         count++;
+   }
+
+   return count;
+}
+
+void DeleteAllPending()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+
+      if(!IsOurOrder(ticket))
+         continue;
+
+      const ENUM_ORDER_TYPE type =
+         (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+
+      if(type != ORDER_TYPE_BUY_STOP && type != ORDER_TYPE_SELL_STOP)
+         continue;
+
+      if(!trade.OrderDelete(ticket))
+      {
+         Print("IronWall: failed to delete pending #", ticket,
+               " retcode=", trade.ResultRetcode(),
+               " ", trade.ResultRetcodeDescription());
+      }
+   }
+}
+
+bool PlaceBuyStop(const double price)
+{
+   const double distance = EffectiveDistance();
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double buyPrice = price;
+   const double minimumPrice = tick.ask + distance;
+
+   if(buyPrice < minimumPrice)
+      buyPrice = minimumPrice;
+
+   buyPrice = NormalizePrice(buyPrice);
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   const bool ok = trade.BuyStop(
+      InpLotSize,
+      buyPrice,
+      _Symbol,
+      0.0,
+      0.0,
+      ORDER_TIME_GTC,
+      0,
+      "IronWall BUY STOP"
+   );
+
+   if(!ok)
+   {
+      Print("IronWall: BUY STOP failed. price=", buyPrice,
+            " retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+   }
+
+   return ok;
+}
+
+bool PlaceSellStop(const double price)
+{
+   const double distance = EffectiveDistance();
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   double sellPrice = price;
+   const double minimumPrice = tick.bid - distance;
+
+   if(sellPrice > minimumPrice)
+      sellPrice = minimumPrice;
+
+   sellPrice = NormalizePrice(sellPrice);
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   const bool ok = trade.SellStop(
+      InpLotSize,
+      sellPrice,
+      _Symbol,
+      0.0,
+      0.0,
+      ORDER_TIME_GTC,
+      0,
+      "IronWall SELL STOP"
+   );
+
+   if(!ok)
+   {
+      Print("IronWall: SELL STOP failed. price=", sellPrice,
+            " retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+   }
+
+   return ok;
+}
+
+//====================================================================
+// POSITION PROTECTION
+//====================================================================
+// BUY position:
+//   upper BUY STOP  = profit boundary / next BUY cycle
+//   lower SELL STOP  = loss boundary / reversal
+//
+// SELL position:
+//   upper BUY STOP   = loss boundary / reversal
+//   lower SELL STOP  = profit boundary / next SELL cycle
+bool SetPositionBoundaries(const double upperPrice,
+                           const double lowerPrice)
+{
+   ulong ticket;
+   ENUM_POSITION_TYPE type;
+   double openPrice;
+   double volume;
+
+   if(!GetOurPosition(ticket, type, openPrice, volume))
+      return false;
+
+   double sl = 0.0;
+   double tp = 0.0;
+
+   if(type == POSITION_TYPE_BUY)
+   {
+      sl = NormalizePrice(lowerPrice);
+      tp = NormalizePrice(upperPrice);
+   }
+   else
+   {
+      sl = NormalizePrice(upperPrice);
+      tp = NormalizePrice(lowerPrice);
+   }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   const bool ok = trade.PositionModify(ticket, sl, tp);
+
+   if(!ok)
+   {
+      Print("IronWall: PositionModify failed. ticket=", ticket,
+            " SL=", sl,
+            " TP=", tp,
+            " retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+   }
+
+   return ok;
+}
+
+//====================================================================
+// INITIAL WALL
+//====================================================================
+void CreateInitialWall()
+{
+   if(g_busy || OurPositionCount() > 0)
+      return;
+
+   const double distance = EffectiveDistance();
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   const double buyPrice  = NormalizePrice(tick.ask + distance);
+   const double sellPrice = NormalizePrice(tick.bid - distance);
+
+   DeleteAllPending();
+
+   const bool buyOK  = PlaceBuyStop(buyPrice);
+   const bool sellOK = PlaceSellStop(sellPrice);
+
+   Print("IronWall: INITIAL WALL | BUY STOP=", buyPrice,
+         " | SELL STOP=", sellPrice,
+         " | BUY=", buyOK,
+         " | SELL=", sellOK);
+}
+
+//====================================================================
+// REBUILD WALL AROUND NEW POSITION
+//====================================================================
+void RebuildWallAroundPosition()
+{
+   if(g_busy)
+      return;
+
+   ulong ticket;
+   ENUM_POSITION_TYPE type;
+   double openPrice;
+   double volume;
+
+   if(!GetOurPosition(ticket, type, openPrice, volume))
+      return;
+
+   const double distance = EffectiveDistance();
+   const double upperPrice = NormalizePrice(openPrice + distance);
+   const double lowerPrice = NormalizePrice(openPrice - distance);
+
+   DeleteAllPending();
+
+   // Set position boundaries first, then place matching pending orders.
+   SetPositionBoundaries(upperPrice, lowerPrice);
+
+   PlaceBuyStop(upperPrice);
+   PlaceSellStop(lowerPrice);
+
+   Print("IronWall: WALL REBUILT | OPEN=", openPrice,
+         " | BUY STOP=", upperPrice,
+         " | SELL STOP=", lowerPrice);
+}
+
+//====================================================================
+// POSITION RESET
+//====================================================================
+bool CloseAllOurPositions()
+{
+   bool allClosed = true;
+
+   for(int pass = 0; pass < 3; pass++)
+   {
+      bool found = false;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         const ulong ticket = PositionGetTicket(i);
+
+         if(!IsOurPosition(ticket))
+            continue;
+
+         found = true;
+
+         if(!trade.PositionClose(ticket))
+         {
+            Print("IronWall: failed to close position #", ticket,
+                  " retcode=", trade.ResultRetcode(),
+                  " ", trade.ResultRetcodeDescription());
+            allClosed = false;
+         }
+      }
+
+      if(!found)
+         break;
+   }
+
+   return allClosed && OurPositionCount() == 0;
+}
+
+bool OpenMarketDirection(const ENUM_DEAL_TYPE direction)
+{
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool ok = false;
+
+   if(direction == DEAL_TYPE_BUY)
+      ok = trade.Buy(InpLotSize, _Symbol, 0.0, 0.0, 0.0, "IronWall BUY");
+   else if(direction == DEAL_TYPE_SELL)
+      ok = trade.Sell(InpLotSize, _Symbol, 0.0, 0.0, 0.0, "IronWall SELL");
+
+   if(!ok)
+   {
+      Print("IronWall: market reopen failed. direction=",
+            direction == DEAL_TYPE_BUY ? "BUY" : "SELL",
+            " retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   return true;
+}
+
+bool ResetToTriggeredDirection(const ENUM_DEAL_TYPE direction)
+{
+   // Normalize the cycle to exactly ONE position with InpLotSize.
+   // This works consistently on netting and hedging accounts.
+   DeleteAllPending();
+
+   if(!CloseAllOurPositions())
+      return false;
+
+   if(!OpenMarketDirection(direction))
+      return false;
+
+   return true;
+}
+
+//====================================================================
+// EMERGENCY REPAIR
+//====================================================================
+void RepairEngine()
+{
+   if(g_busy)
+      return;
+
+   const int positions = OurPositionCount();
+   const int pending    = OurPendingCount();
+
+   // No position = exactly two pending orders.
+   if(positions == 0)
+   {
+      if(pending != 2)
+         CreateInitialWall();
+
+      return;
+   }
+
+   // Position active = exactly two pending orders.
+   if(positions == 1 && pending != 2)
+      RebuildWallAroundPosition();
+}
+
+//====================================================================
+// TRADE TRANSACTION
+//====================================================================
+void OnTradeTransaction(
+   const MqlTradeTransaction &trans,
+   const MqlTradeRequest &request,
+   const MqlTradeResult &result)
+{
+   if(g_busy)
+      return;
+
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   if(trans.deal == 0)
+      return;
+
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+
+   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber)
+      return;
+
+   const ENUM_DEAL_ENTRY entry =
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+
+   if(entry != DEAL_ENTRY_IN)
+      return;
+
+   const ENUM_DEAL_TYPE dealType =
+      (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+
+   if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL)
+      return;
+
+   // A BUY STOP or SELL STOP has just been triggered.
+   g_busy = true;
+
+   Print("IronWall: TRIGGER | ",
+         dealType == DEAL_TYPE_BUY ? "BUY" : "SELL",
+         " deal=", trans.deal);
+
+   if(ResetToTriggeredDirection(dealType))
+   {
+      g_busy = false;
+      RebuildWallAroundPosition();
+      return;
+   }
+
+   Print("IronWall: trigger recovery failed. Repair will retry.");
+
+   g_busy = false;
+   RepairEngine();
+}
+
+//====================================================================
+// LIFECYCLE
+//====================================================================
 int OnInit()
 {
-   ATRHandle = iATR(_Symbol, PERIOD_M15, ATRPeriod);
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
 
-   if(ATRHandle == INVALID_HANDLE)
-      return INIT_FAILED;
+   if(InpLotSize <= 0.0)
+   {
+      Print("IronWall: invalid lot size.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
-   trade.SetExpertMagicNumber(MagicNumber);
+   if(InpDistancePrice <= 0.0)
+   {
+      Print("IronWall: invalid distance.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
-   EMA50Handle = iMA(_Symbol, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE);
+   Print("==================================================");
+   Print("IronWall V1 started");
+   Print("Symbol   : ", _Symbol);
+   Print("Lot      : ", InpLotSize);
+   Print("Distance : ", InpDistancePrice);
+   Print("Magic    : ", InpMagicNumber);
+   Print("Mode     : DUAL PENDING / REVERSAL ENGINE");
+   Print("Filters  : NONE");
+   Print("==================================================");
 
-   EMA200Handle = iMA(_Symbol, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE);
-
-   if(EMA50Handle == INVALID_HANDLE || EMA200Handle == INVALID_HANDLE)
-      return INIT_FAILED;
-
-   LastHistoryDeals = HistoryDealsTotal();
+   RepairEngine();
 
    return INIT_SUCCEEDED;
 }
 
-//==================================================
-// ONDEINIT
-//==================================================
-
 void OnDeinit(const int reason)
 {
-   if(ATRHandle != INVALID_HANDLE)
-      IndicatorRelease(ATRHandle);
-
-   if(EMA50Handle != INVALID_HANDLE)
-      IndicatorRelease(EMA50Handle);
-
-   if(EMA200Handle != INVALID_HANDLE)
-      IndicatorRelease(EMA200Handle);
+   Print("IronWall V1 stopped. reason=", reason);
 }
-
-//==================================================
-// ONTICK
-//==================================================
 
 void OnTick()
 {
-   // Detect posisi yang baru saja tutup
-   DetectPositionClosed();
-
-   // Hapus pending lawan jika posisi sudah aktif
-   CheckTriggeredPosition();
-
-   // Position management tetap berjalan walaupun spread sedang tinggi
-   ApplyBreakEven();
-   ApplyTrailing();
-
-   // Entry baru
-   if(!SpreadAllowed())
-      return;
-
-   if(GetATR() <= 0)
-      return;
-
-   // Entry baru hanya jika:
-   // - tidak ada posisi
-   // - tidak ada pending
-   // - cooldown selesai
-   if(NoPositionAndNoPending() && CooldownFinished())
-   {
-      PlacePendingOrders();
-   }
+   RepairEngine();
 }
-
-//==================================================
-// SPREAD FILTER
-//==================================================
-
-bool SpreadAllowed()
-{
-   double spread =
-      (SymbolInfoDouble(_Symbol, SYMBOL_ASK) -
-       SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
-
-   return(spread <= MaxSpread);
-}
-
-//==================================================
-// ATR
-//==================================================
-
-double GetATR()
-{
-   double buffer[];
-   ArraySetAsSeries(buffer, true);
-
-   if(CopyBuffer(ATRHandle, 0, 0, 1, buffer) <= 0)
-      return 0;
-
-   return buffer[0];
-}
-
-//==================================================
-// CHECK POSITION
-//==================================================
-
-bool HasPosition()
-{
-   for(int i=0; i<PositionsTotal(); i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetInteger(POSITION_MAGIC) == (long)MagicNumber &&
-            PositionGetString(POSITION_SYMBOL) == _Symbol)
-         {
-            return true;
-         }
-      }
-   }
-
-   return false;
-}
-
-//==================================================
-// CHECK PENDING
-//==================================================
-
-bool HasPending()
-{
-   for(int i=0; i<OrdersTotal(); i++)
-   {
-      ulong ticket = OrderGetTicket(i);
-
-      if(OrderSelect(ticket))
-      {
-         if(OrderGetInteger(ORDER_MAGIC) == (long)MagicNumber &&
-            OrderGetString(ORDER_SYMBOL) == _Symbol)
-         {
-            return true;
-         }
-      }
-   }
-
-   return false;
-}
-
-//==================================================
-// NO POSITION + NO PENDING
-//==================================================
-
-bool NoPositionAndNoPending()
-{
-   return(!HasPosition() && !HasPending());
-}
-
-//==================================================
-// PLACE PENDING
-//==================================================
-
-void PlacePendingOrders()
-{
-   double atr = GetATR();
-
-   if(atr <= 0)
-      return;
-
-   if(atr < MinATR)
-      return;
-
-   double distance = atr * EntryATRMultiplier;
-
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   double stopLevel =
-      SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-
-   double buyPrice = NormalizeDouble(ask + distance, _Digits);
-   double sellPrice = NormalizeDouble(bid - distance, _Digits);
-
-   //=====================
-   // BUY
-   //=====================
-
-   double buySL = NormalizeDouble(
-      buyPrice - (atr * SL_ATR_Multiplier),
-      _Digits
-   );
-
-   double buyTP = NormalizeDouble(
-      buyPrice + (atr * TP_ATR_Multiplier),
-      _Digits
-   );
-
-   //=====================
-   // SELL
-   //=====================
-
-   double sellSL = NormalizeDouble(
-      sellPrice + (atr * SL_ATR_Multiplier),
-      _Digits
-   );
-
-   double sellTP = NormalizeDouble(
-      sellPrice - (atr * TP_ATR_Multiplier),
-      _Digits
-   );
-
-   bool buyResult = false;
-   bool sellResult = false;
-
-   //=====================
-   // BUY TREND
-   //=====================
-
-   if(TrendBuy())
-   {
-      if(buyPrice - ask >= stopLevel)
-      {
-         buyResult = trade.BuyStop(
-            Lots,
-            buyPrice,
-            _Symbol,
-            buySL,
-            buyTP
-         );
-      }
-   }
-
-   //=====================
-   // SELL TREND
-   //=====================
-
-   if(TrendSell())
-   {
-      if(bid - sellPrice >= stopLevel)
-      {
-         sellResult = trade.SellStop(
-            Lots,
-            sellPrice,
-            _Symbol,
-            sellSL,
-            sellTP
-         );
-      }
-   }
-
-   //=====================
-   // LOG
-   //=====================
-
-   if(buyResult || sellResult)
-   {
-      LastPendingTime = TimeCurrent();
-
-      Print("Pending Created");
-   }
-   else
-   {
-      Print(
-         "No Pending Created. TrendBuy=",
-         TrendBuy(),
-         " TrendSell=",
-         TrendSell(),
-         " ATR=",
-         atr,
-         " StopLevel=",
-         stopLevel
-      );
-   }
-}
-
-//==================================================
-// DELETE OPPOSITE
-//==================================================
-
-void DeleteAllPending()
-{
-   for(int i=OrdersTotal()-1; i>=0; i--)
-   {
-      ulong ticket = OrderGetTicket(i);
-
-      if(OrderSelect(ticket))
-      {
-         if(OrderGetInteger(ORDER_MAGIC) == (long)MagicNumber &&
-            OrderGetString(ORDER_SYMBOL) == _Symbol)
-         {
-            trade.OrderDelete(ticket);
-         }
-      }
-   }
-}
-
-//==================================================
-// CHECK TRIGGER
-//==================================================
-
-void CheckTriggeredPosition()
-{
-   if(!HasPosition())
-      return;
-
-   DeleteAllPending();
-}
-
-//==================================================
-// BREAK EVEN ENGINE
-//==================================================
-
-void ApplyBreakEven()
-{
-   double atr = GetATR();
-
-   if(atr <= 0)
-      return;
-
-   double stopLevel =
-      SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-
-   for(int i=0; i<PositionsTotal(); i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != (long)MagicNumber ||
-         PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      ENUM_POSITION_TYPE type =
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl = PositionGetDouble(POSITION_SL);
-      double tp = PositionGetDouble(POSITION_TP);
-      string symbol = PositionGetString(POSITION_SYMBOL);
-
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-      //=========================
-      // BUY
-      //=========================
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         double profitDistance = bid - open;
-
-         if(profitDistance < atr * BE_ATR_Multiplier)
-            continue;
-
-         if((bid - open) <= stopLevel)
-            continue;
-
-         if(sl < open - _Point)
-         {
-            trade.PositionModify(symbol, open, tp);
-         }
-      }
-
-      //=========================
-      // SELL
-      //=========================
-
-      if(type == POSITION_TYPE_SELL)
-      {
-         double profitDistance = open - ask;
-
-         if(profitDistance < atr * BE_ATR_Multiplier)
-            continue;
-
-         if((open - ask) <= stopLevel)
-            continue;
-
-         // SELL BE harus tetap valid
-         double beSL = ask + stopLevel + (_Point * 5);
-
-         if(sl == 0 || sl > beSL)
-         {
-            trade.PositionModify(symbol, beSL, tp);
-         }
-      }
-   }
-}
-
-//==================================================
-// TRAILING ENGINE
-//==================================================
-
-void ApplyTrailing()
-{
-   double atr = GetATR();
-
-   if(atr <= 0)
-      return;
-
-   for(int i=0; i<PositionsTotal(); i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != (long)MagicNumber ||
-         PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      ENUM_POSITION_TYPE type =
-         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl = PositionGetDouble(POSITION_SL);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-      double profitDistance =
-         (type == POSITION_TYPE_BUY) ? bid - open : open - ask;
-
-      if(profitDistance < atr * TrailStartATR)
-         continue;
-
-      double newSL;
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         newSL = bid - (atr * TrailATR);
-
-         if(sl == 0 || newSL > sl)
-         {
-            string symbol = PositionGetString(POSITION_SYMBOL);
-            double tp = PositionGetDouble(POSITION_TP);
-
-            trade.PositionModify(symbol, newSL, tp);
-         }
-      }
-      else
-      {
-         newSL = ask + (atr * TrailATR);
-
-         if(sl == 0 || newSL < sl)
-         {
-            string symbol = PositionGetString(POSITION_SYMBOL);
-            double tp = PositionGetDouble(POSITION_TP);
-
-            trade.PositionModify(symbol, newSL, tp);
-         }
-      }
-   }
-}
-
-//==================================================
-// DETECT POSITION
-//==================================================
-
-void DetectPositionClosed()
-{
-   if(!HistorySelect(0, TimeCurrent()))
-      return;
-
-   int deals = HistoryDealsTotal();
-
-   if(deals > LastHistoryDeals)
-   {
-      for(int i=LastHistoryDeals; i<deals; i++)
-      {
-         ulong dealTicket = HistoryDealGetTicket(i);
-
-         if(dealTicket == 0)
-            continue;
-
-         if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != (long)MagicNumber)
-            continue;
-
-         if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
-            continue;
-
-         ENUM_DEAL_ENTRY entry =
-            (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-
-         if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
-         {
-            LastCloseTime = TimeCurrent();
-
-            Print("Cooldown Start");
-         }
-      }
-
-      LastHistoryDeals = deals;
-   }
-}
-
-//==================================================
-// COOLDOWN
-//==================================================
-
-bool CooldownFinished()
-{
-   return(TimeCurrent() > LastCloseTime + (CooldownMinutes * 60));
-}
-
-//==================================================
-// TREND BUY
-//==================================================
-
-bool TrendBuy()
-{
-   double ema50[];
-   double ema200[];
-
-   ArraySetAsSeries(ema50, true);
-   ArraySetAsSeries(ema200, true);
-
-   if(CopyBuffer(EMA50Handle, 0, 0, 1, ema50) <= 0)
-      return false;
-
-   if(CopyBuffer(EMA200Handle, 0, 0, 1, ema200) <= 0)
-      return false;
-
-   return(ema50[0] > ema200[0]);
-}
-
-//==================================================
-// TREND SELL
-//==================================================
-
-bool TrendSell()
-{
-   double ema50[];
-   double ema200[];
-
-   ArraySetAsSeries(ema50, true);
-   ArraySetAsSeries(ema200, true);
-
-   if(CopyBuffer(EMA50Handle, 0, 0, 1, ema50) <= 0)
-      return false;
-
-   if(CopyBuffer(EMA200Handle, 0, 0, 1, ema200) <= 0)
-      return false;
-
-   return(ema50[0] < ema200[0]);
-}
+//+------------------------------------------------------------------+
